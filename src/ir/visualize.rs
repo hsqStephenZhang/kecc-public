@@ -224,3 +224,23 @@ impl Visualizer {
         Ok(format!("subgraph \"cluster.{name}.{bid}\" {{\n{inner}\n}}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crate::ir;
+
+    use super::*;
+
+    #[test]
+    fn test_visualizer() {
+        let file_path = Path::new("examples/ir0/fib2.ir");
+        let mut visualizer = Visualizer::default();
+        let source = Parse {}
+            .translate(&file_path)
+            .expect("parse failed while parsing the output from implemented printer");
+        let result = visualizer.translate(&source).unwrap();
+        println!("{}", result);
+    }
+}

@@ -7,7 +7,16 @@ const INDENT: usize = 4;
 
 impl WriteLine for Asm {
     fn write_line(&self, indent: usize, write: &mut dyn Write) -> Result<()> {
-        self.unit.write_line(indent, write)
+        writeln!(
+            write,
+            r#"
+.section .text
+.global main
+
+main:
+    ret"#
+        )
+        // self.unit.write_line(indent, write)
     }
 }
 

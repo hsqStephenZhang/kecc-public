@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::mem::forget;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -87,9 +88,13 @@ pub fn test_write_c(path: &Path) {
 
     write(&unit, &mut temp_file).unwrap();
 
-    let new_unit = Parse
-        .translate(&temp_file_path.as_path())
-        .expect("parse failed while parsing the output from implemented printer");
+    let new_unit = match Parse.translate(&temp_file_path.as_path()) {
+        Ok(res) => res,
+        Err(e) => {
+            forget(temp_dir);
+            panic!("{:?}", e);
+        }
+    };
 
     if !unit.is_equiv(&new_unit) {
         let mut buf = String::new();
@@ -133,7 +138,7 @@ pub fn test_irgen(path: &Path) {
         .to_string();
 
     // Compile c file: If fails, test is vacuously success
-    if !Command::new("clang")
+    let status = Command::new("clang")
         .args([
             "-fsanitize=float-divide-by-zero",
             "-fsanitize=undefined",
@@ -143,12 +148,8 @@ pub fn test_irgen(path: &Path) {
             &bin_path,
         ])
         .stderr(Stdio::null())
-        .status()
-        .unwrap()
-        .success()
-    {
-        ::std::process::exit(SKIP_TEST);
-    }
+        .status();
+    assert!(status.unwrap().success());
 
     // Execute compiled executable
     let mut child = Command::new(fs::canonicalize(bin_path).unwrap())
@@ -156,28 +157,22 @@ pub fn test_irgen(path: &Path) {
         .spawn()
         .expect("failed to execute the compiled executable");
 
-    let Some(status) = child
+    let status = child
         .wait_timeout(Duration::from_millis(1000))
-        .expect("failed to obtain exit status from child process")
-    else {
-        println!("timeout occurs");
-        child.kill().unwrap();
-        let _ = child.wait().unwrap();
-        ::std::process::exit(SKIP_TEST);
-    };
+        .expect("failed to obtain exit status from child process");
+    assert!(status.is_some(), "irgen timed out");
+    let status = status.unwrap();
 
-    if child
-        .stderr
-        .expect("`stderr` of `child` must be `Some`")
-        .bytes()
-        .next()
-        .is_some()
-    {
-        println!("error occurs");
-        ::std::process::exit(SKIP_TEST);
-    }
+    assert!(
+        child
+            .stderr
+            .expect("`stderr` of `child` must be `Some`")
+            .bytes()
+            .next()
+            .is_none()
+    );
 
-    let status = some_or_exit!(status.code(), SKIP_TEST);
+    let status = status.code().expect("`status` must have an exit code");
 
     // Interpret resolved ir
     let args = Vec::new();
@@ -339,15 +334,16 @@ pub fn test_asmgen(path: &Path) {
     write(&asm, &mut buffer).unwrap();
 
     // Compile the assembly code
-    if !Command::new("riscv64-linux-gnu-gcc")
+    let res = Command::new("riscv64-linux-gnu-gcc")
         .args(["-static", &asm_path_str, "-o", &bin_path_str])
         .stderr(Stdio::null())
-        .status()
-        .unwrap()
-        .success()
-    {
-        ::std::process::exit(SKIP_TEST);
-    }
+        .status();
+
+    assert!(res.is_ok());
+    assert!(
+        res.unwrap().success(),
+        "asmgen failed to compile the assembly code"
+    );
 
     // Emulate the executable
     let mut child = Command::new("qemu-riscv64-static")
@@ -356,28 +352,23 @@ pub fn test_asmgen(path: &Path) {
         .spawn()
         .expect("failed to execute the compiled executable");
 
-    let Some(status) = child
+    let status = child
         .wait_timeout(Duration::from_millis(1000))
-        .expect("failed to obtain exit status from child process")
-    else {
-        println!("timeout occurs");
-        child.kill().unwrap();
-        let _ = child.wait().unwrap();
-        ::std::process::exit(SKIP_TEST);
-    };
+        .expect("failed to obtain exit status from child process");
 
-    if child
-        .stderr
-        .expect("`stderr` of `child` must be `Some`")
-        .bytes()
-        .next()
-        .is_some()
-    {
-        println!("error occurs");
-        ::std::process::exit(SKIP_TEST);
-    }
+    assert!(status.is_some(), "asmgen timed out");
+    let status = status.unwrap();
 
-    let qemu_status = some_or_exit!(status.code(), SKIP_TEST);
+    assert!(
+        child
+            .stderr
+            .expect("`stderr` of `child` must be `Some`")
+            .bytes()
+            .next()
+            .is_none()
+    );
+
+    let qemu_status = status.code().expect("`status` must have an exit code");
     drop(buffer);
     temp_dir.close().expect("temp dir deletion failed");
 
@@ -406,7 +397,7 @@ pub fn test_end_to_end(path: &Path) {
         .to_string();
 
     // Compile c file: If fails, test is vacuously success
-    if !Command::new("clang")
+    let status = Command::new("clang")
         .args([
             "-fsanitize=float-divide-by-zero",
             "-fsanitize=undefined",
@@ -416,12 +407,9 @@ pub fn test_end_to_end(path: &Path) {
             &bin_path,
         ])
         .stderr(Stdio::null())
-        .status()
-        .unwrap()
-        .success()
-    {
-        ::std::process::exit(SKIP_TEST);
-    }
+        .status();
+
+    assert!(status.unwrap().success());
 
     // Execute compiled executable
     let mut child = Command::new(fs::canonicalize(bin_path.clone()).unwrap())
@@ -434,28 +422,23 @@ pub fn test_end_to_end(path: &Path) {
         .status()
         .expect("failed to remove compiled executable");
 
-    let Some(status) = child
+    let status = child
         .wait_timeout(Duration::from_millis(1000))
-        .expect("failed to obtain exit status from child process")
-    else {
-        println!("timeout occurs");
-        child.kill().unwrap();
-        let _ = child.wait().unwrap();
-        ::std::process::exit(SKIP_TEST);
-    };
+        .expect("failed to obtain exit status from child process");
 
-    if child
-        .stderr
-        .expect("`stderr` of `child` must be `Some`")
-        .bytes()
-        .next()
-        .is_some()
-    {
-        println!("error occurs");
-        ::std::process::exit(SKIP_TEST);
-    }
+    assert!(status.is_some(), "end-to-end test timed out");
+    let status = status.unwrap();
 
-    let clang_status = some_or_exit!(status.code(), SKIP_TEST);
+    assert!(
+        child
+            .stderr
+            .expect("`stderr` of `child` must be `Some`")
+            .bytes()
+            .next()
+            .is_none()
+    );
+
+    let clang_status = status.code().expect("`status` must have an exit code");
 
     // Execute optimized IR
     let mut ir = Irgen::default()
@@ -498,15 +481,11 @@ pub fn test_end_to_end(path: &Path) {
     write(&asm, &mut buffer).unwrap();
 
     // Compile the assembly code
-    if !Command::new("riscv64-linux-gnu-gcc")
+    let status = Command::new("riscv64-linux-gnu-gcc")
         .args(["-static", &asm_path_str, "-o", &bin_path_str])
         .stderr(Stdio::null())
-        .status()
-        .unwrap()
-        .success()
-    {
-        ::std::process::exit(SKIP_TEST);
-    }
+        .status();
+    assert!(status.unwrap().success());
 
     // Emulate the executable
     let mut child = Command::new("qemu-riscv64-static")
@@ -515,28 +494,22 @@ pub fn test_end_to_end(path: &Path) {
         .spawn()
         .expect("failed to execute the compiled executable");
 
-    let Some(status) = child
+    let status = child
         .wait_timeout(Duration::from_millis(1000))
-        .expect("failed to obtain exit status from child process")
-    else {
-        println!("timeout occurs");
-        child.kill().unwrap();
-        let _ = child.wait().unwrap();
-        ::std::process::exit(SKIP_TEST);
-    };
+        .expect("failed to obtain exit status from child process");
+    assert!(status.is_some(), "end-to-end test timed out");
+    let status = status.unwrap();
 
-    if child
-        .stderr
-        .expect("`stderr` of `child` must be `Some`")
-        .bytes()
-        .next()
-        .is_some()
-    {
-        println!("error occurs");
-        ::std::process::exit(SKIP_TEST);
-    }
+    assert!(
+        child
+            .stderr
+            .expect("`stderr` of `child` must be `Some`")
+            .bytes()
+            .next()
+            .is_none()
+    );
 
-    let qemu_status = some_or_exit!(status.code(), SKIP_TEST);
+    let qemu_status = status.code().expect("`status` must have an exit code");
     drop(buffer);
     temp_dir.close().expect("temp dir deletion failed");
 
