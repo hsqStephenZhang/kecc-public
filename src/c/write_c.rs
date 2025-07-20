@@ -915,9 +915,9 @@ impl WriteString for UnaryOperatorExpression {
             UnaryOperator::PostDecrement => format!("{}--", self.operand.write_string()),
             UnaryOperator::PreIncrement => format!("++{}", self.operand.write_string()),
             UnaryOperator::PreDecrement => format!("--{}", self.operand.write_string()),
-            UnaryOperator::Address => format!("&{}", self.operand.write_string()),
-            UnaryOperator::Indirection => format!("*{}", self.operand.write_string()),
-            UnaryOperator::Complement => format!("~{}", self.operand.write_string()),
+            UnaryOperator::Address => format!("&({})", self.operand.write_string()),
+            UnaryOperator::Indirection => format!("*({})", self.operand.write_string()),
+            UnaryOperator::Complement => format!("~({})", self.operand.write_string()),
             UnaryOperator::Negate => format!("!({})", self.operand.write_string()),
         }
     }
