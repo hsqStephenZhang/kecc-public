@@ -1024,6 +1024,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
+    use serde_json::json;
     use tempfile::tempdir;
 
     use crate::{IsEquiv, Parse, Translate, write_base::WriteLine};
@@ -1101,6 +1102,18 @@ struct Big {
     #[test]
     fn t1() {
         let input = r#"
+int foo(int x, int y, int z) {
+    if (x == y) {
+        return y;
+    } else {
+        return z;
+    }
+}
+
+int main() {
+    return foo(0, 1, -1) == -1;
+}
+
         "#;
 
         let temp_dir = tempdir().expect("temp dir creation failed");
@@ -1113,7 +1126,8 @@ struct Big {
         let unit = Parse
             .translate(&temp_file_path)
             .unwrap_or_else(|_| panic!("parse failed {}", temp_file_path.display()));
-        println!("{:?}", unit);
+        // println!("{:?}", unit);
+        println!("{}", json!(unit));
         unit.write_line(0, &mut std::io::stdout())
             .expect("failed to write output");
 

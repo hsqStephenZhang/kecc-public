@@ -40,13 +40,14 @@ use core::{fmt, mem};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 
-use itertools::izip;
+use itertools::{Either, izip};
 use lang_c::ast::*;
 use lang_c::driver::Parse;
 use lang_c::span::Node;
+use serde_json::json;
 use thiserror::Error;
 
-use crate::ir::{DtypeError, HasDtype, Named};
+use crate::ir::{DtypeError, HasDtype, Instruction, JumpArg, Named};
 use crate::write_base::WriteString;
 use crate::*;
 
@@ -59,6 +60,13 @@ pub struct IrgenError {
 impl IrgenError {
     pub fn new(code: String, message: IrgenErrorMessage) -> Self {
         Self { code, message }
+    }
+
+    pub fn other(code: String) -> Self {
+        Self {
+            code,
+            message: IrgenErrorMessage::Other,
+        }
     }
 }
 
@@ -89,6 +97,8 @@ pub enum IrgenErrorMessage {
     InvalidDtype { dtype_error: DtypeError },
     #[error("l-value required as {message}")]
     RequireLvalue { message: String },
+    #[error("other")]
+    Other,
 }
 
 /// A C file going through IR generation.
@@ -365,7 +375,7 @@ impl Irgen {
         // Creates the init block that stores arguments.
         irgen
             .translate_parameter_decl(&signature, irgen.bid_init, &name_of_params, &mut context)
-            .map_err(|e| {
+            .map_err(|e: IrgenErrorMessage| {
                 IrgenError::new(format!("specs: {specifiers:#?}\ndecl: {declarator:#?}"), e)
             })?;
 
@@ -451,7 +461,7 @@ struct Context {
     /// The block id of the current context.
     bid: ir::BlockId,
     /// Current instructions of the block.
-    instrs: Vec<Named<ir::Instruction>>,
+    instrs: Vec<Named<Instruction>>,
 }
 
 impl Context {
@@ -464,10 +474,7 @@ impl Context {
     }
 
     // Adds `instr` to the current context.
-    fn insert_instruction(
-        &mut self,
-        instr: ir::Instruction,
-    ) -> Result<ir::Operand, IrgenErrorMessage> {
+    fn insert_instruction(&mut self, instr: Instruction) -> Result<ir::Operand, IrgenErrorMessage> {
         let dtype = instr.dtype();
         self.instrs.push(Named::new(None, instr));
 
@@ -504,6 +511,12 @@ struct IrgenFunc<'i> {
     symbol_table: Vec<HashMap<String, ir::Operand>>,
 }
 
+/// type cast: https://en.cppreference.com/w/c/language/conversion.html
+/// we implement the following cast rules:
+///     1. Conversion as if by assignment
+///     2. Usual arithmetic conversions
+///         a. one of operands is float
+///         b. ...
 impl IrgenFunc<'_> {
     /// Allocate a new block id.
     fn alloc_bid(&mut self) -> ir::BlockId {
@@ -546,6 +559,34 @@ impl IrgenFunc<'_> {
         }
     }
 
+    /// utils
+
+    fn find_symbol(&self, name: &str) -> Option<&ir::Operand> {
+        for tbl in self.symbol_table.iter().rev() {
+            if let Some(v) = tbl.get(name) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn find_callee(&self, expr: &Expression) -> Option<ir::Operand> {
+        if let Expression::Identifier(id) = expr {
+            self.find_symbol(&id.node.name).cloned()
+        } else {
+            None
+        }
+    }
+
+    fn current_scope(&self) -> &HashMap<String, ir::Operand> {
+        self.symbol_table.last().unwrap()
+    }
+
+    fn current_scope_mut(&mut self) -> &mut HashMap<String, ir::Operand> {
+        self.symbol_table.last_mut().unwrap()
+    }
+    /// utils end
+
     /// Enter a scope and create a new symbol table entry, i.e, we are at a `{` in the function.
     fn enter_scope(&mut self) {
         self.symbol_table.push(HashMap::new());
@@ -581,6 +622,111 @@ impl IrgenFunc<'_> {
         Ok(())
     }
 
+    // add identifier to current symbol table
+    // TODO: merge it with global declration?
+    fn translate_local_declaration(
+        &mut self,
+        source: &Declaration,
+        context: &mut Context,
+    ) -> Result<(), IrgenError> {
+        let (base_dtype, is_typedef) =
+            ir::Dtype::try_from_ast_declaration_specifiers(&source.specifiers).map_err(|e| {
+                IrgenError::new(
+                    format!("{source:#?}"),
+                    IrgenErrorMessage::InvalidDtype { dtype_error: e },
+                )
+            })?;
+        let base_dtype = base_dtype.resolve_typedefs(&self.typedefs).map_err(|e| {
+            IrgenError::new(
+                format!("{source:#?}"),
+                IrgenErrorMessage::InvalidDtype { dtype_error: e },
+            )
+        })?;
+
+        // TODO: resolve struct fields
+        for init_decl in &source.declarators {
+            let declarator = &init_decl.node.declarator.node;
+            let name = name_of_declarator(declarator);
+            let dtype = base_dtype
+                .clone()
+                .with_ast_declarator(declarator)
+                .map_err(|e| {
+                    IrgenError::new(
+                        format!("{source:#?}"),
+                        IrgenErrorMessage::InvalidDtype { dtype_error: e },
+                    )
+                })?
+                .deref()
+                .clone();
+            let dtype = dtype.resolve_typedefs(&self.typedefs).map_err(|e| {
+                IrgenError::new(
+                    format!("{source:#?}"),
+                    IrgenErrorMessage::InvalidDtype { dtype_error: e },
+                )
+            })?;
+            if !is_typedef && is_invalid_structure(&dtype, &self.structs) {
+                return Err(IrgenError::new(
+                    format!("{source:#?}"),
+                    IrgenErrorMessage::Misc {
+                        message: "incomplete struct type".to_string(),
+                    },
+                ));
+            }
+
+            if is_typedef {
+                // Add new typedef if nothing has been declared before
+                let prev_dtype = self.typedefs.get(&name).unwrap();
+
+                if prev_dtype != &dtype {
+                    return Err(IrgenError::new(
+                        format!("{source:#?}"),
+                        IrgenErrorMessage::ConflictingDtype {
+                            dtype,
+                            protorype_dtype: prev_dtype.clone(),
+                        },
+                    ));
+                }
+
+                continue;
+            }
+
+            // Creates a new declaration based on the dtype.
+            let mut decl = ir::Declaration::try_from(dtype.clone()).map_err(|e| {
+                IrgenError::new(
+                    format!("{source:#?}"),
+                    IrgenErrorMessage::InvalidDtype { dtype_error: e },
+                )
+            })?;
+
+            let dtype = decl.dtype();
+            let named = Named::new(Some(name.clone()), dtype.clone());
+            let rid = self.insert_alloc(named.clone());
+            let ptr = ir::Operand::Register {
+                rid,
+                dtype: ir::Dtype::pointer(dtype.clone()),
+            };
+            let _ = self.current_scope_mut().insert(name.clone(), ptr.clone());
+
+            // TODO: is it correct
+            if let Some(initializer) = init_decl.node.initializer.as_ref() {
+                match &initializer.node {
+                    Initializer::Expression(node) => {
+                        let value = self.translate_expr(&node.node, false, context)?;
+                        // assign cast2: initialization
+                        let value = cast(value, &dtype, context);
+                        let inst = Instruction::Store {
+                            ptr,
+                            value: value.clone(),
+                        };
+                        let _ = context.insert_instruction(inst).unwrap();
+                    }
+                    Initializer::List(nodes) => todo!(),
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Transalte a C statement `stmt` under the current block `context`, with `continue` block
     /// `bid_continue` and break block `bid_break`.
     fn translate_stmt(
@@ -590,7 +736,841 @@ impl IrgenFunc<'_> {
         bid_continue: Option<ir::BlockId>,
         bid_break: Option<ir::BlockId>,
     ) -> Result<(), IrgenError> {
-        todo!()
+        // TODO: enter/leave scope
+        match stmt {
+            Statement::Labeled(node) => {
+                self.translate_stmt(&node.node.statement.node, context, bid_continue, bid_break)?;
+            }
+            Statement::Compound(vec) => {
+                for blockitem in vec {
+                    match &blockitem.node {
+                        BlockItem::Declaration(node) => {
+                            self.translate_local_declaration(&node.node, context)?
+                        }
+                        BlockItem::Statement(node) => {
+                            self.translate_stmt(&node.node, context, bid_continue, bid_break)?
+                        }
+                        BlockItem::StaticAssert(node) => todo!(),
+                    }
+                }
+            }
+            Statement::Expression(node) => {
+                if let Some(node) = node {
+                    let _ = self.translate_expr(&node.node, false, context)?;
+                }
+            }
+
+            /// b_before:
+            ///     before
+            ///     jmp b_cond
+            /// b_cond:
+            ///     %cond = eval cond
+            ///     br %cond b_then, b_else
+            /// b_then:
+            ///     body
+            ///     jmp b_after
+            /// b_else:
+            ///     Option<body>
+            ///     jmp b_after
+            /// b_after:
+            ///     ...
+            Statement::If(node) => {
+                let condition = &node.node.condition;
+                let op = self.translate_expr(&condition.node, true, context)?;
+
+                let mut ctx_then = Context::new(self.alloc_bid());
+                let mut ctx_else = Context::new(self.alloc_bid());
+                let mut ctx_after = Context::new(self.alloc_bid());
+                let arg_then = JumpArg::new(ctx_then.bid, vec![]);
+                let arg_else = JumpArg::new(ctx_else.bid, vec![]);
+                let arg_after = JumpArg::new(ctx_after.bid, vec![]);
+
+                // 0. exit current block
+                mem::swap(&mut ctx_after, context);
+                self.insert_block(
+                    ctx_after,
+                    ir::BlockExit::ConditionalJump {
+                        condition: op,
+                        arg_then,
+                        arg_else,
+                    },
+                );
+
+                // 1. then stmt
+                self.translate_stmt(
+                    &node.node.then_statement.node,
+                    &mut ctx_then,
+                    bid_continue,
+                    bid_break,
+                )?;
+                self.insert_block(
+                    ctx_then,
+                    ir::BlockExit::Jump {
+                        arg: arg_after.clone(),
+                    },
+                );
+
+                // 2. else stmt
+                if let Some(stmt) = &node.node.else_statement {
+                    self.translate_stmt(&stmt.node, &mut ctx_else, bid_continue, bid_break)?;
+                }
+                self.insert_block(ctx_else, ir::BlockExit::Jump { arg: arg_after });
+            }
+            /// %expr = eval expr
+            /// switch %expr default b_default() [
+            ///    x b_x
+            ///    y b_y
+            /// ]
+            /// b_after:
+            ///     after
+            /// b_x:
+            ///     body
+            ///     jmp b_after
+            /// b_y:
+            ///     body
+            ///     jmp b_after
+            /// b_default:
+            ///     body
+            ///     jmp b_after
+            ///
+            /// we only support switch stmt with default case
+            /// and all case shall be constant expr
+            Statement::Switch(node) => {
+                let op = self.translate_expr(&node.node.expression.node, false, context)?;
+                let mut b_after = Context::new(self.alloc_bid());
+                let bid_after = b_after.bid;
+                let jmp_arg = JumpArg::new(bid_after, vec![]);
+
+                let mut cases = vec![];
+                let mut default = None;
+
+                let Statement::Compound(compound) = &node.node.statement.node else {
+                    unreachable!("single statement in switch: {:?}", node)
+                };
+                for blockitem in compound {
+                    match &blockitem.node {
+                        BlockItem::Statement(node) => {
+                            // the bid_break will be used inside the case's stmt
+                            // so we need not to insert block here
+                            let mut ctx_case = Context::new(self.alloc_bid());
+                            let bid = ctx_case.bid;
+                            self.translate_stmt(&node.node, &mut ctx_case, bid_continue, None);
+                            self.insert_block(
+                                ctx_case,
+                                ir::BlockExit::Jump {
+                                    arg: jmp_arg.clone(),
+                                },
+                            );
+                            // TODO: more robust
+                            let Statement::Labeled(label) = &node.node else {
+                                unreachable!()
+                            };
+                            match &label.node.label.node {
+                                Label::Identifier(..) | Label::CaseRange(..) => todo!(),
+                                Label::Case(node) => {
+                                    // we only support constant
+                                    let Expression::Constant(constant) = &node.node else {
+                                        unreachable!()
+                                    };
+                                    let c = ir::Constant::try_from(&constant.node).unwrap();
+                                    cases.push((c, JumpArg::new(bid, vec![])));
+                                }
+                                Label::Default => {
+                                    default = Some(JumpArg::new(bid, vec![]));
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                let switch_exit = ir::BlockExit::Switch {
+                    value: op,
+                    default: default.unwrap(),
+                    cases,
+                };
+                mem::swap(context, &mut b_after);
+                self.insert_block(b_after, switch_exit);
+                // now active context is in b_after
+            }
+            /// b_before:
+            ///     before
+            ///     jmp b_cond
+            /// b_cond:
+            ///     %expr = eval expr
+            ///     br %expr b_body, b_after
+            /// b_body:
+            ///     body
+            ///     jmp b_cond
+            /// b_after:
+            ///     after
+            Statement::While(node) => {
+                let mut ctx_cond = Context::new(self.alloc_bid());
+                let mut ctx_body = Context::new(self.alloc_bid());
+                let mut ctx_after = Context::new(self.alloc_bid());
+
+                let bid_cond = ctx_cond.bid;
+                let bid_after = ctx_after.bid;
+
+                let jmp_cond = JumpArg::new(ctx_cond.bid, vec![]);
+                let jmp_body = JumpArg::new(ctx_body.bid, vec![]);
+                let jmp_after = JumpArg::new(ctx_after.bid, vec![]);
+
+                // 0. finalize current block
+                mem::swap(context, &mut ctx_after);
+                self.insert_block(
+                    ctx_after,
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(bid_cond, vec![]),
+                    },
+                );
+
+                // 1. cond
+                let op = self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
+                let exit = ir::BlockExit::ConditionalJump {
+                    condition: op,
+                    arg_then: jmp_body.clone(),
+                    arg_else: jmp_after.clone(),
+                };
+                self.insert_block(ctx_cond, exit);
+
+                // 2. body
+                self.enter_scope();
+                self.translate_stmt(
+                    &node.node.statement.node,
+                    &mut ctx_body,
+                    Some(bid_cond),
+                    Some(bid_after),
+                );
+                self.insert_block(
+                    ctx_body,
+                    ir::BlockExit::Jump {
+                        arg: jmp_cond.clone(),
+                    },
+                );
+                self.exit_scope();
+
+                // 3. after, nothing to do, current active context is ctx_after
+            }
+            /// b_before:
+            ///     before
+            ///     jmp b_body
+            /// b_body:
+            ///     body
+            ///     jmp b_cond
+            /// b_cond:
+            ///     %expr = eval expr
+            ///     br %expr b_body, b_after
+            /// b_after:
+            ///     after
+            Statement::DoWhile(node) => {
+                let mut ctx_body = Context::new(self.alloc_bid());
+                let mut ctx_cond = Context::new(self.alloc_bid());
+                let mut ctx_after = Context::new(self.alloc_bid());
+
+                let bid_body = ctx_body.bid;
+                let bid_cond = ctx_cond.bid;
+                let bid_after = ctx_after.bid;
+
+                let jmp_cond = JumpArg::new(ctx_cond.bid, vec![]);
+                let jmp_body = JumpArg::new(ctx_body.bid, vec![]);
+                let jmp_after = JumpArg::new(ctx_after.bid, vec![]);
+
+                // 0. finalize current block
+                mem::swap(context, &mut ctx_after);
+                self.insert_block(
+                    ctx_after,
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(bid_body, vec![]),
+                    },
+                );
+
+                // 1. body
+                self.enter_scope();
+                self.translate_stmt(
+                    &node.node.statement.node,
+                    &mut ctx_body,
+                    Some(bid_body),
+                    Some(bid_after),
+                );
+                self.insert_block(
+                    ctx_body,
+                    ir::BlockExit::Jump {
+                        arg: jmp_cond.clone(),
+                    },
+                );
+                self.exit_scope();
+
+                // 2. cond
+                let op = self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
+                let exit = ir::BlockExit::ConditionalJump {
+                    condition: op,
+                    arg_then: jmp_body.clone(),
+                    arg_else: jmp_after.clone(),
+                };
+                self.insert_block(ctx_cond, exit);
+
+                // 3. after, nothing to do, current active context is ctx_after
+            }
+            /// b_before:
+            ///     before
+            ///     jmp b_init
+            /// b_init:
+            ///     initializer
+            ///     jmp b_cond
+            /// b_cond:
+            ///     %cond = eval cond
+            ///     br %cond b_body, b_after
+            /// b_body:
+            ///     body
+            ///     jmp b_step
+            /// b_step:
+            ///     step
+            ///     jmp b_cond
+            /// b_after:
+            ///     after
+            Statement::For(node) => {
+                self.enter_scope();
+
+                let mut ctx_init = Context::new(self.alloc_bid());
+                let mut ctx_cond = Context::new(self.alloc_bid());
+                let mut ctx_body = Context::new(self.alloc_bid());
+                let mut ctx_step = Context::new(self.alloc_bid());
+                let mut ctx_after = Context::new(self.alloc_bid());
+                let bid_after = ctx_after.bid;
+
+                let jmp_cond = JumpArg::new(ctx_cond.bid, vec![]);
+                let jmp_body = JumpArg::new(ctx_body.bid, vec![]);
+                let jmp_after = JumpArg::new(ctx_after.bid, vec![]);
+                let jmp_step = JumpArg::new(ctx_step.bid, vec![]);
+                let jmp_after = JumpArg::new(ctx_after.bid, vec![]);
+
+                // 0. freeze current block
+                mem::swap(context, &mut ctx_after);
+                self.insert_block(
+                    ctx_after,
+                    ir::BlockExit::Jump {
+                        arg: JumpArg::new(ctx_init.bid, vec![]),
+                    },
+                );
+                // 1. initializer
+                match &node.node.initializer.node {
+                    ForInitializer::Empty => {}
+                    ForInitializer::Expression(node) => {
+                        // should not load the value
+                        let _ = self.translate_expr(&node.node, true, &mut ctx_init)?;
+                    }
+                    ForInitializer::Declaration(node) => {
+                        self.translate_local_declaration(&node.node, &mut ctx_init)?;
+                    }
+                    ForInitializer::StaticAssert(node) => todo!(),
+                }
+                self.insert_block(
+                    ctx_init,
+                    ir::BlockExit::Jump {
+                        arg: jmp_cond.clone(),
+                    },
+                );
+
+                // 2. cond
+                if let Some(cond) = &node.node.condition {
+                    let op = self.translate_expr(&cond.node, true, &mut ctx_cond)?;
+                    let exit = ir::BlockExit::ConditionalJump {
+                        condition: op,
+                        arg_then: jmp_body.clone(),
+                        arg_else: jmp_after.clone(),
+                    };
+                    self.insert_block(ctx_cond, exit);
+                } else {
+                    self.insert_block(
+                        ctx_cond,
+                        ir::BlockExit::Jump {
+                            arg: jmp_body.clone(),
+                        },
+                    );
+                }
+
+                // 3. body
+                self.enter_scope();
+                self.translate_stmt(
+                    &node.node.statement.node,
+                    &mut ctx_body,
+                    Some(ctx_step.bid),
+                    Some(bid_after),
+                );
+                self.insert_block(
+                    ctx_body,
+                    ir::BlockExit::Jump {
+                        arg: jmp_step.clone(),
+                    },
+                );
+                self.exit_scope();
+
+                // 4. step
+                if let Some(step) = &node.node.step {
+                    // discard
+                    let _ = self.translate_expr(&step.node, false, &mut ctx_step)?;
+                }
+                self.insert_block(
+                    ctx_step,
+                    ir::BlockExit::Jump {
+                        arg: jmp_cond.clone(),
+                    },
+                );
+                self.exit_scope();
+
+                // 5. after, nothing to do, since the active context is now ctx_after now
+            }
+            Statement::Goto(node) => todo!(),
+            Statement::Continue => {
+                if let Some(c) = bid_continue {
+                    let mut new_context = Context::new(self.alloc_bid());
+                    mem::swap(&mut new_context, context);
+                    let jmp_continue = JumpArg::new(c, vec![]);
+                    self.insert_block(new_context, ir::BlockExit::Jump { arg: jmp_continue });
+                }
+            }
+            Statement::Break => {
+                if let Some(b) = bid_break {
+                    let mut new_context = Context::new(self.alloc_bid());
+                    mem::swap(&mut new_context, context);
+                    let jmp_break = JumpArg::new(b, vec![]);
+                    self.insert_block(new_context, ir::BlockExit::Jump { arg: jmp_break });
+                }
+            }
+            Statement::Return(node) => {
+                if let Some(node) = node {
+                    let op = self.translate_expr(&node.node, false, context)?;
+                    let op = if op.local_rid().is_some() {
+                        let ptr = op.to_pointer().unwrap();
+                        let load = Instruction::Load { ptr };
+                        context.insert_instruction(load).unwrap()
+                    } else {
+                        op
+                    };
+                    let return_type = self.return_type.clone();
+                    // assign cast4: return
+                    let value = cast(op, &return_type, context);
+
+                    let mut new_context = Context::new(self.alloc_bid());
+                    mem::swap(&mut new_context, context);
+                    self.insert_block(new_context, ir::BlockExit::Return { value });
+                }
+            }
+            Statement::Asm(node) => todo!(),
+        }
+        Ok(())
+    }
+
+    fn get_orig_ptr(&mut self, expr: &Expression) -> Option<ir::Operand> {
+        match expr {
+            Expression::Identifier(node) => {
+                let value = self.find_symbol(&node.node.name).cloned();
+                let op = match value {
+                    Some(op) => op,
+                    None => panic!("{}, symbol table: {:?}", json!(expr), self.symbol_table),
+                };
+                Some(op)
+            }
+            _ => None,
+        }
+    }
+
+    /// translate expr, will walk the expr tree in post order
+    /// ```C
+    ///    a = b + c * d;
+    /// ```
+    fn translate_expr(
+        &mut self,
+        expr: &Expression,
+        not_deref: bool,
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenError> {
+        // TODO: conditional expr
+        let op = match expr {
+            Expression::Identifier(node) => {
+                let value = self.find_symbol(&node.node.name).cloned();
+                let op = match value {
+                    Some(op) => op,
+                    None => panic!("{}, symbol table: {:?}", json!(expr), self.symbol_table),
+                };
+                // TODO: when shall we load the value from allocation?
+                // if it's the first access of the function argument
+                // store the value from function arg to local allocation slot
+
+                if !not_deref && (op.is_global() || op.is_alloc() || op.is_arg()) {
+                    let load = Instruction::Load { ptr: op };
+                    context.insert_instruction(load).unwrap()
+                } else {
+                    op
+                }
+            }
+            Expression::Constant(node) => {
+                let constant = ir::Constant::try_from(&node.node).unwrap();
+                ir::Operand::constant(constant)
+            }
+            /// if it's ++ or --, then do the following transform and return
+            /// the correct operand by it's pre/post semantic
+            /// x = ++i =>
+            ///       %expr
+            ///       %1 = add %expr 1
+            ///       %2 = store %1 i
+            /// should return %1
+            ///
+            /// y = i++ =>
+            ///       %expr
+            ///       %1 = add i 1
+            ///       %2 = store %1 i
+            /// should return %expr
+            ///
+            /// TODO: type cast
+            Expression::UnaryOperator(node) => {
+                if let Some((is_pre, bin_op)) = assign_unary_pre_or_post(&node.node.operator.node) {
+                    // expr
+                    let op = self.translate_expr(&node.node.operand.node, false, context)?;
+                    let dtype = op.dtype();
+                    let ptr = self.get_orig_ptr(&node.node.operand.node).unwrap();
+                    // i1
+                    let const1 = ir::Constant::int(1, dtype.clone());
+                    let inst1 = Instruction::BinOp {
+                        op: bin_op,
+                        lhs: op.clone(),
+                        rhs: ir::Operand::Constant(const1),
+                        dtype: dtype.clone(),
+                    };
+                    // i2
+                    let op1 = context.insert_instruction(inst1).unwrap();
+                    // TODO: do we need type cast here?
+                    // `a++` is not the same as `a+=1`,
+                    // in `a+=1`, 1 is an int
+                    // but in `a++`, we create a const 1 with the same type of a
+                    let store = Instruction::Store {
+                        ptr,
+                        value: op1.clone(),
+                    };
+                    let _ = context.insert_instruction(store);
+                    // finalize operand
+                    if is_pre { op1 } else { op }
+                } else {
+                    let operand = self.translate_expr(&node.node.operand.node, false, context)?;
+                    let dtype = operand.dtype();
+                    let inst = Instruction::UnaryOp {
+                        op: node.node.operator.node.clone(),
+                        operand,
+                        dtype,
+                    };
+                    context.insert_instruction(inst).unwrap()
+                }
+            }
+            /// TODO: type cast
+            /// TODO: logical expression evaluation
+            ///
+            /// if is assign (can be = or ++), then lhs must be a pointer, rhs must be a value
+            /// if not, then lhs and rhs are both values
+            Expression::BinaryOperator(node) => {
+                // both lhs and rhs might be a local allocation
+                // use the `maybe_load_local` instead of `translate_expr` result
+
+                /// if node's operator is +=, -=, *=, then transform into the corresponding
+                /// more and insert the following extra instructions:
+                /// lhs += rhs:
+                ///      %1 = add lhs rhs
+                ///      %2 = store %1
+                ///
+                /// should return %2
+                if let Some(assign_op) = assign_binop(&node.node.operator.node) {
+                    let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
+                    let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
+                    let lhs_ptr = self.get_orig_ptr(&node.node.lhs.node).unwrap();
+                    let dtype_ptr = lhs_ptr.dtype();
+                    let dtype = dtype_ptr.get_pointer_inner().cloned().unwrap();
+                    // assign cast1: assignment operator
+                    let rhs = cast(rhs, &dtype, context);
+                    // %1
+                    let compute = Instruction::BinOp {
+                        op: assign_op,
+                        lhs,
+                        rhs,
+                        dtype,
+                    };
+                    // %2
+                    let op2 = context.insert_instruction(compute).unwrap();
+                    let store = Instruction::Store {
+                        ptr: lhs_ptr,
+                        value: op2.clone(),
+                    };
+                    let _ = context.insert_instruction(store);
+                    op2
+                } else if matches!(&node.node.operator.node, BinaryOperator::Assign) {
+                    let lhs = self.translate_expr(&node.node.lhs.node, true, context)?;
+                    let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
+                    let lhs_ptr = self.get_orig_ptr(&node.node.lhs.node).unwrap();
+                    let dtype_ptr = lhs_ptr.dtype();
+                    let dtype = dtype_ptr.get_pointer_inner().cloned().unwrap();
+                    let rhs = cast(rhs, &dtype, context);
+                    let store = Instruction::Store {
+                        ptr: lhs_ptr,
+                        value: rhs.clone(),
+                    };
+                    let _ = context.insert_instruction(store);
+                    rhs
+                } else {
+                    let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
+                    let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
+                    let mut rhs = rhs;
+                    let dtype = match lhs.binop_dtype(&rhs, &node.node.operator.node) {
+                        Some(dtype) => dtype,
+                        None => {
+                            let cast = Instruction::TypeCast {
+                                value: rhs,
+                                target_dtype: lhs.dtype(),
+                            };
+                            rhs = context.insert_instruction(cast).unwrap();
+                            lhs.binop_dtype(&rhs, &node.node.operator.node).unwrap()
+                        }
+                    };
+
+                    /// x && y && z
+                    ///
+                    /// b_current:
+                    ///     %value_x = eval x
+                    ///     %cmp_x = cmp eq %value_x 0 (if value_x is not bit type)
+                    ///     %br %cmp_x b_x_nonzero,b_x_zero
+                    ///
+                    /// b_z...
+                    ///     ...
+                    /// 
+                    /// b_y_nonzero:
+                    ///     ...
+                    ///     jmp b_y_after
+                    /// b_y_zero:
+                    ///     ...
+                    ///     jmp b_y_after
+                    /// b_y_after:
+                    ///     ...
+                    ///
+                    /// b_x_nonzero:
+                    ///     %value_x = eval x
+                    ///     %cmp_x = cmp eq %value_x 0
+                    ///     store %cmp_x tmp*
+                    ///     jmp b_after_x
+                    /// b_x_zero:
+                    ///     store %0 tmp*
+                    ///     jmp b_after_x
+                    /// b_after_x:
+                    ///     %is_nonzero = load tmp*
+                    ///     br %is_nonzero b_y_nonzero,b_y_zero
+                    let res = match &node.node.operator.node {
+                        BinaryOperator::Index => {
+                            let inst = Instruction::GetElementPtr {
+                                ptr: lhs,
+                                offset: rhs,
+                                dtype,
+                            };
+                            context.insert_instruction(inst).unwrap()
+                        }
+                        _ => {
+                            let inst = Instruction::BinOp {
+                                op: node.node.operator.node.clone(),
+                                lhs,
+                                rhs,
+                                dtype,
+                            };
+                            context.insert_instruction(inst).unwrap()
+                        }
+                    };
+                    res
+                }
+            }
+            Expression::Statement(node) => todo!(),
+            Expression::StringLiteral(node) => todo!(),
+            Expression::GenericSelection(node) => todo!(),
+            Expression::Member(node) => todo!(),
+            Expression::Call(node) => {
+                // TODO: if callee is a function pointer
+                let Expression::Identifier(ident) = &node.node.callee.node else {
+                    unreachable!()
+                };
+                let callee = self.find_symbol(&ident.node.name).cloned().unwrap();
+                if let ir::Operand::Constant(c) = &callee
+                    && let ir::Constant::GlobalVariable { dtype, .. } = c
+                    && let ir::Dtype::Function { ret, params } = dtype
+                {
+                    let mut args = vec![];
+                    assert_eq!(params.len(), node.node.arguments.len());
+                    for (expr, target_dtype) in node.node.arguments.iter().zip(params) {
+                        let op = self.translate_expr(&expr.node, false, context)?;
+                        // assign cast3: function call
+                        let op = cast(op, target_dtype, context);
+                        args.push(op);
+                    }
+
+                    // let callee = self.translate_expr(&node.node.callee.node, false, context)?;
+                    let inst = Instruction::Call {
+                        callee: callee.clone(),
+                        args,
+                        return_type: *ret.clone(),
+                    };
+                    context.insert_instruction(inst).unwrap()
+                } else {
+                    unreachable!("{callee}")
+                }
+            }
+            Expression::CompoundLiteral(node) => todo!(),
+            Expression::SizeOfTy(node) => {
+                let tname = node
+                    .node
+                    .0
+                    .node
+                    .specifiers
+                    .iter()
+                    .filter_map(|spec| {
+                        if let SpecifierQualifier::TypeSpecifier(spec) = &spec.node {
+                            type_size(&spec.node)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(tname.len(), 1);
+                ir::Operand::constant(ir::Constant::int(
+                    tname[0] as _,
+                    ir::Dtype::int(64).signed(false),
+                ))
+            }
+            Expression::SizeOfVal(node) => {
+                let res = self.translate_expr(&node.node.0.node, false, context)?;
+                let dtype = res.dtype();
+                let (size, _) = dtype.size_align_of(&self.structs).unwrap();
+                ir::Operand::constant(ir::Constant::int(
+                    size as _,
+                    ir::Dtype::int(64).signed(false),
+                ))
+            }
+            Expression::AlignOf(node) => {
+                let tname = node
+                    .node
+                    .0
+                    .node
+                    .specifiers
+                    .iter()
+                    .filter_map(|spec| {
+                        if let SpecifierQualifier::TypeSpecifier(spec) = &spec.node {
+                            type_align(&spec.node)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(tname.len(), 1);
+                let dtype = ir::Dtype::int(64).signed(false);
+                ir::Operand::constant(ir::Constant::int(tname[0] as _, dtype))
+            }
+            Expression::Cast(node) => {
+                let op = self.translate_expr(&node.node.expression.node, false, context)?;
+                // TODO: resolve struct and typedef types
+                let dtype = ir::Dtype::try_from(&node.node.type_name.node).unwrap();
+                let cast = cast(op, &dtype, context);
+                cast
+            }
+            /// b_before:
+            ///     before
+            ///     br %expr b_then, b_else
+            /// b_then:
+            ///     store %then_expr tmp
+            ///     jmp b_after
+            /// b_else:
+            ///     store %else_expr tmp
+            ///     jmp b_after
+            /// b_after:
+            ///     after
+            Expression::Conditional(node) => {
+                let op = self.translate_expr(&node.node.condition.node, false, context)?;
+
+                let mut ctx_then = Context::new(self.alloc_bid());
+                let mut ctx_else = Context::new(self.alloc_bid());
+                let mut ctx_after = Context::new(self.alloc_bid());
+                let bid_then = ctx_then.bid;
+                let bid_else = ctx_else.bid;
+                let bid_after = ctx_after.bid;
+                let arg_then = JumpArg::new(bid_then, vec![]);
+                let arg_else = JumpArg::new(bid_else, vec![]);
+                let arg_after = JumpArg::new(bid_after, vec![]);
+
+                mem::swap(context, &mut ctx_after);
+
+                // 0. finalize current block
+                self.insert_block(
+                    ctx_after,
+                    ir::BlockExit::ConditionalJump {
+                        condition: op,
+                        arg_then,
+                        arg_else,
+                    },
+                );
+
+                // 1.1 then expr
+                let op =
+                    self.translate_expr(&node.node.then_expression.node, false, &mut ctx_then)?;
+                let dtype = op.dtype();
+
+                // -1. delay the temp value allocation until we know the concrete type
+                let named = Named::new(Some(self.alloc_tempid()), dtype.clone());
+                let rid = self.insert_alloc(named.clone());
+                let ptr = ir::Operand::Register {
+                    rid,
+                    dtype: ir::Dtype::pointer(dtype.clone()),
+                };
+                let _ = self
+                    .current_scope_mut()
+                    .insert(named.name().cloned().unwrap(), ptr.clone());
+
+                // 1.2 then expr
+                let store1 = Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: op,
+                };
+                ctx_then.insert_instruction(store1);
+                self.insert_block(
+                    ctx_then,
+                    ir::BlockExit::Jump {
+                        arg: arg_after.clone(),
+                    },
+                );
+
+                // 2. else expr
+                let op =
+                    self.translate_expr(&node.node.else_expression.node, false, &mut ctx_else)?;
+                // TODO: doe we need to cast type here?
+                let store1 = Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: op,
+                };
+                ctx_else.insert_instruction(store1);
+                self.insert_block(
+                    ctx_else,
+                    ir::BlockExit::Jump {
+                        arg: arg_after.clone(),
+                    },
+                );
+
+                // 3. now the active context is ctx_after
+                //    return the load of the temp value as the return result of the whole conditional expr
+                let load = Instruction::Load { ptr: ptr.clone() };
+                context.insert_instruction(load).unwrap()
+            }
+            Expression::Comma(vec) => {
+                let mut op = None;
+                for expr in vec.iter() {
+                    op = Some(self.translate_expr(&expr.node, false, context)?);
+                }
+                op.unwrap()
+            }
+            Expression::OffsetOf(node) => todo!(),
+            Expression::VaArg(node) => todo!(),
+        };
+
+        Ok(op)
     }
 
     /// Translate initial parameter declarations of the functions to IR.
@@ -666,7 +1646,33 @@ impl IrgenFunc<'_> {
         name_of_params: &[String],
         context: &mut Context,
     ) -> Result<(), IrgenErrorMessage> {
-        todo!()
+        for (idx, (name, t)) in name_of_params
+            .iter()
+            .zip(signature.params.iter())
+            .enumerate()
+        {
+            let named = Named::new(Some(name.into()), t.clone());
+            // alloc
+            let rid = self.insert_alloc(named.clone());
+            let ptr = ir::Operand::Register {
+                rid,
+                dtype: ir::Dtype::pointer(t.clone()),
+            };
+            let value = ir::Operand::Register {
+                rid: ir::RegisterId::arg(bid_init.clone(), idx),
+                dtype: t.clone(),
+            };
+            // no need to cast
+            let inst = Instruction::Store {
+                ptr: ptr.clone(),
+                value: value.clone(),
+            };
+            let op = context.insert_instruction(inst).unwrap();
+            let _ = self.current_scope_mut().insert(name.clone(), ptr.clone());
+            self.phinodes_init.push(named);
+        }
+
+        Ok(())
     }
 }
 
@@ -784,4 +1790,147 @@ fn is_invalid_structure(dtype: &ir::Dtype, structs: &HashMap<String, Option<ir::
     } else {
         false
     }
+}
+
+fn assign_binop(op: &BinaryOperator) -> Option<BinaryOperator> {
+    match op {
+        BinaryOperator::AssignMultiply => Some(BinaryOperator::Multiply),
+        BinaryOperator::AssignDivide => Some(BinaryOperator::Divide),
+        BinaryOperator::AssignModulo => Some(BinaryOperator::Modulo),
+        BinaryOperator::AssignPlus => Some(BinaryOperator::Plus),
+        BinaryOperator::AssignMinus => Some(BinaryOperator::Minus),
+        BinaryOperator::AssignShiftLeft => Some(BinaryOperator::ShiftLeft),
+        BinaryOperator::AssignShiftRight => Some(BinaryOperator::ShiftRight),
+        BinaryOperator::AssignBitwiseAnd => Some(BinaryOperator::BitwiseAnd),
+        BinaryOperator::AssignBitwiseXor => Some(BinaryOperator::BitwiseXor),
+        BinaryOperator::AssignBitwiseOr => Some(BinaryOperator::BitwiseOr),
+        _ => None,
+    }
+}
+
+// returns: (if its's a self assign pre operator, the corresponding bin op)
+fn assign_unary_pre_or_post(op: &UnaryOperator) -> Option<(bool, BinaryOperator)> {
+    match op {
+        UnaryOperator::PreIncrement => Some((true, BinaryOperator::Plus)),
+        UnaryOperator::PreDecrement => Some((true, BinaryOperator::Minus)),
+        UnaryOperator::PostIncrement => Some((false, BinaryOperator::Plus)),
+        UnaryOperator::PostDecrement => Some((false, BinaryOperator::Minus)),
+        _ => None,
+    }
+}
+
+fn identifier(expr: &Expression) -> Option<String> {
+    if let Expression::Identifier(id) = expr {
+        Some(id.node.name.clone())
+    } else {
+        None
+    }
+}
+
+fn cast(orig: ir::Operand, target_dtype: &ir::Dtype, context: &mut Context) -> ir::Operand {
+    if orig.dtype() == *target_dtype {
+        orig
+    } else {
+        let cast_inst = Instruction::TypeCast {
+            value: orig,
+            target_dtype: target_dtype.clone(),
+        };
+        context.insert_instruction(cast_inst).unwrap()
+    }
+}
+
+// fn maybe_load_from_alloc(
+//     op: ir::Operand,
+//     context: &mut Context,
+// ) -> Either<(ir::Operand, ir::Operand), ir::Operand> {
+//     if let Some(rid) = op.local_rid().cloned() {
+//         let ptr = ir::Dtype::pointer(op.dtype());
+//         let ptr = ir::Operand::Register { rid, dtype: ptr };
+//         Either::Left((
+//             context
+//                 .insert_instruction(Instruction::Load { ptr: ptr.clone() })
+//                 .unwrap(),
+//             ptr,
+//         ))
+//     } else {
+//         Either::Right(op)
+//     }
+// }
+
+fn type_size(t: &TypeSpecifier) -> Option<usize> {
+    let r = match t {
+        TypeSpecifier::Char => 1,
+        TypeSpecifier::Short => 2,
+        TypeSpecifier::Int => 4,
+        TypeSpecifier::Long => 8,
+        TypeSpecifier::Float => 4,
+        TypeSpecifier::Double => 8,
+        TypeSpecifier::Bool => 4,
+        TypeSpecifier::Atomic(node) => todo!(),
+        TypeSpecifier::Struct(node) => todo!(),
+        TypeSpecifier::Enum(node) => todo!(),
+        TypeSpecifier::TypedefName(node) => todo!(),
+        _ => return None,
+    };
+    Some(r)
+}
+
+fn type_align(t: &TypeSpecifier) -> Option<usize> {
+    let r = match t {
+        TypeSpecifier::Char => 1,
+        TypeSpecifier::Short => 2,
+        TypeSpecifier::Int => 4,
+        TypeSpecifier::Long => 8,
+        TypeSpecifier::Float => 4,
+        TypeSpecifier::Double => 8,
+        TypeSpecifier::Bool => 4,
+        TypeSpecifier::Atomic(node) => todo!(),
+        TypeSpecifier::Struct(node) => todo!(),
+        TypeSpecifier::Enum(node) => todo!(),
+        TypeSpecifier::TypedefName(node) => todo!(),
+        _ => return None,
+    };
+    Some(r)
+}
+
+fn type_of_expr(expr: &Expression) -> Option<ir::Dtype> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+
+    struct ExprEvaluator;
+
+    impl ExprEvaluator {
+        fn eval(&self, expr: &Expression) -> ir::Operand {
+            let typedefs = Default::default();
+            let structs = Default::default();
+            let mut irgen = IrgenFunc {
+                return_type: ir::Dtype::unit(),
+                bid_init: Irgen::BID_INIT,
+                phinodes_init: Vec::new(),
+                allocations: Vec::new(),
+                blocks: BTreeMap::new(),
+                bid_counter: Irgen::BID_COUNTER_INIT,
+                tempid_counter: Irgen::TEMPID_COUNTER_INIT,
+                typedefs: &typedefs,
+                structs: &structs,
+                symbol_table: vec![],
+            };
+            let stmt = Statement::Expression(Some(Box::new(Node {
+                node: expr.clone(),
+                span: lang_c::span::Span::span(0, 0),
+            })));
+            let mut context = Context::new(Irgen::BID_INIT);
+
+            irgen.translate_stmt(&stmt, &mut context, None, None);
+            todo!()
+        }
+    }
+
+    use super::*;
+
+    #[test]
+    fn test_expr() {}
 }

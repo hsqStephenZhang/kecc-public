@@ -10,7 +10,6 @@
     elided_lifetimes_in_paths,
     explicit_outlives_requirements,
     keyword_idents,
-    let_underscore_drop,
     macro_use_extern_crate,
     meta_variable_misuse,
     missing_abi,

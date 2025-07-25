@@ -493,6 +493,99 @@ impl Operand {
             None
         }
     }
+
+    pub fn binop_dtype(&self, other: &Self, op: &ast::BinaryOperator) -> Option<Dtype> {
+        match op {
+            ast::BinaryOperator::Index => {
+                // self must be pointer type
+                // will return the deref-ed type
+                if let Operand::Register { dtype, .. } = self
+                    && let Dtype::Pointer { inner, .. } = dtype
+                {
+                    Some(*inner.clone())
+                } else {
+                    None
+                }
+            }
+            ast::BinaryOperator::Less
+            | ast::BinaryOperator::LessOrEqual
+            | ast::BinaryOperator::Greater
+            | ast::BinaryOperator::GreaterOrEqual
+            | ast::BinaryOperator::Equals
+            | ast::BinaryOperator::NotEquals
+            | ast::BinaryOperator::LogicalAnd
+            | ast::BinaryOperator::LogicalOr => {
+                if self.dtype() == other.dtype() {
+                    Some(Dtype::int(1).signed(false))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                if self.dtype() == other.dtype() {
+                    Some(self.dtype())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub fn local_rid(&self) -> Option<&RegisterId> {
+        if let Self::Register { rid, .. } = self {
+            if matches!(rid, RegisterId::Local { .. }) {
+                return Some(rid);
+            }
+        }
+        None
+    }
+
+    pub fn to_pointer(&self) -> Option<Self> {
+        if let Self::Register { rid, dtype } = self {
+            let ptr = Dtype::pointer(dtype.clone());
+            let ptr = Self::Register {
+                rid: *rid,
+                dtype: ptr,
+            };
+            Some(ptr)
+        } else if let Self::Constant(constant) = self
+            && let Constant::GlobalVariable { .. } = constant
+        {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn is_global(&self) -> bool {
+        if let Self::Constant(constant) = self
+            && let Constant::GlobalVariable { .. } = constant
+        {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_alloc(&self) -> bool {
+        if let Self::Register { rid, .. } = self
+            && let RegisterId::Local { .. } = rid
+        {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_arg(&self) -> bool {
+        if let Self::Register { rid, .. } = self
+            && let RegisterId::Arg { .. } = rid
+        {
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl fmt::Display for Operand {
@@ -674,7 +767,7 @@ impl TryFrom<&ast::Constant> for Constant {
                     value < threshold
                 };
 
-                Ok(Self::int(value, dtype.set_signed(is_signed)))
+                Ok(Self::int(value, dtype.signed(is_signed)))
             }
             ast::Constant::Float(float) => {
                 let pat = match float.base {
@@ -977,7 +1070,7 @@ impl HasDtype for Constant {
             Self::Unit => Dtype::unit(),
             Self::Int {
                 width, is_signed, ..
-            } => Dtype::int(*width).set_signed(*is_signed),
+            } => Dtype::int(*width).signed(*is_signed),
             Self::Float { width, .. } => Dtype::float(*width),
             Self::GlobalVariable { dtype, .. } => Dtype::pointer(dtype.clone()),
         }
@@ -1024,5 +1117,35 @@ impl<T> Named<T> {
 impl<T: fmt::Display> fmt::Display for Named<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::{Instruction, Operand, RegisterId};
+
+    #[test]
+    fn test_display() {
+        let dst = Operand::register(
+            RegisterId::local(1),
+            super::Dtype::Int {
+                width: 32,
+                is_signed: true,
+                is_const: false,
+            },
+        );
+        let src = Operand::register(
+            RegisterId::local(1),
+            super::Dtype::Int {
+                width: 32,
+                is_signed: true,
+                is_const: false,
+            },
+        );
+        let inst = Instruction::Store {
+            ptr: dst,
+            value: src,
+        };
+        println!("{}", inst);
     }
 }

@@ -73,7 +73,7 @@ impl HasDtype for Value {
             Self::Unit => Dtype::unit(),
             Self::Int {
                 width, is_signed, ..
-            } => Dtype::int(*width).set_signed(*is_signed),
+            } => Dtype::int(*width).signed(*is_signed),
             Self::Float { width, .. } => Dtype::float(*width),
             Self::Pointer { dtype, .. } => Dtype::pointer(dtype.clone()),
             Self::Array {

@@ -101,7 +101,7 @@ peg::parser! {
         rule dtype_inner() -> Dtype =
             "unit" { Dtype::unit() }
         /
-            "u" n:number() { Dtype::int(n).set_signed(false) }
+            "u" n:number() { Dtype::int(n).signed(false) }
         /
             "i" n:number() { Dtype::int(n) }
         /

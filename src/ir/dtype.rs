@@ -114,6 +114,12 @@ pub enum Dtype {
     },
 }
 
+// impl Dtype {
+//     pub fn pointer(dtype: Dtype) -> Self {
+//         Self::Pointer { inner: Box::new(dtype), is_const: false }
+//     }
+// }
+
 impl BaseDtype {
     /// Apply `StorageClassSpecifier` to `BaseDtype`.
     ///
@@ -462,7 +468,7 @@ impl TryFrom<BaseDtype> for Dtype {
                 });
             }
 
-            dtype = dtype.set_signed(is_signed);
+            dtype = dtype.signed(is_signed);
         }
 
         dtype = dtype.set_const(spec.is_const);
@@ -1005,14 +1011,14 @@ impl Dtype {
     }
 
     #[must_use]
-    pub fn set_signed(&self, is_signed: bool) -> Self {
+    pub fn signed(self, is_signed: bool) -> Self {
         match self {
             Self::Int {
                 width, is_const, ..
             } => Self::Int {
-                width: *width,
+                width,
                 is_signed,
-                is_const: *is_const,
+                is_const,
             },
             _ => panic!("`signed` and `unsigned` only be applied to `Dtype::Int`"),
         }
