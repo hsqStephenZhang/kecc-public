@@ -820,6 +820,20 @@ impl Dtype {
         }
     }
 
+    #[inline]
+    pub fn is_int(&self, width: Option<usize>) -> bool {
+        if let Self::Int { width: w, .. } = self {
+            width.is_none() || width == Some(*w)
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub fn is_array(&self) -> bool {
+        matches!(self, Self::Array { .. })
+    }
+
     pub fn is_const(&self) -> bool {
         match self {
             Self::Unit { is_const }
@@ -1330,6 +1344,75 @@ impl Dtype {
         };
 
         Ok(dtype)
+    }
+
+    /// ```c
+    /// typedef struct {
+    ///     char a;
+    ///     struct {
+    ///         int b[4][5];
+    ///     };
+    ///     double c;
+    /// } Temp;
+    /// ```
+    ///
+    /// for this c struct, we will generate two struct def,
+    /// the first is t0 for the inner anonymous struct, the send is t1 for the Temp
+    /// when acess temp.b, we will lookup the offset of field b in the Temp struct
+    /// the lookup of the field that matches the identifier `b` is recursive
+    ///
+    pub fn resolve_struct_field_offset(
+        &self,
+        target: &str,
+        structs: &HashMap<String, Option<Dtype>>,
+    ) -> Option<(usize, Dtype)> {
+        if let Self::Struct {
+            fields,
+            size_align_offsets,
+            name,
+            ..
+        } = self
+        {
+            match (fields, size_align_offsets) {
+                (Some(fields), Some((size, align, offsets))) => {
+                    assert_eq!(fields.len(), offsets.len());
+                    let mut total_offset = 0;
+                    for (idx, field) in fields.iter().enumerate() {
+                        match field.name() {
+                            Some(field_name) => {
+                                if field_name == target {
+                                    return Some((offsets[idx], field.inner().clone()));
+                                }
+                            }
+                            // anonymous type, we lookup inner
+                            None => {
+                                let dtype = field.inner();
+                                let struct_name = dtype.get_struct_name().unwrap().clone().unwrap();
+                                let anonymous_struct = structs.get(&struct_name).unwrap();
+                                if let Some(Some(anonymous_struct)) = structs.get(&struct_name)
+                                    && let Some((offset, dtype)) = anonymous_struct
+                                        .resolve_struct_field_offset(target, structs)
+                                {
+                                    return Some((offsets[idx] + offset, dtype));
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn index_dtype(&self) -> Self {
+        match self {
+            Dtype::Pointer { inner, is_const } => *inner.clone(),
+            Dtype::Array { inner, size } => *inner.clone(),
+            _ => todo!()
+        }
     }
 }
 

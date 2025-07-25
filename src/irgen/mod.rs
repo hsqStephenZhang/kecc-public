@@ -585,6 +585,46 @@ impl IrgenFunc<'_> {
     fn current_scope_mut(&mut self) -> &mut HashMap<String, ir::Operand> {
         self.symbol_table.last_mut().unwrap()
     }
+
+    // TODO: configurable
+    fn size_of_size_t(&self) -> usize {
+        32
+    }
+
+    fn size_of_pointer(&self) -> usize {
+        64
+    }
+
+    fn type_of_expr(&self, expr: &Expression) -> Option<ir::Dtype> {
+        match expr {
+            Expression::Identifier(node) => self
+                .find_symbol(&node.node.name)
+                .cloned()
+                .map(|op| op.dtype()),
+            Expression::Constant(node) => {
+                ir::Constant::try_from(&node.node).ok().map(|c| c.dtype())
+            }
+            Expression::UnaryOperator(node) => {
+                let op = self.type_of_expr(&node.node.operand.node);
+                op.map(|op| match &node.node.operator.node {
+                    UnaryOperator::Address => {
+                        todo!()
+                    }
+                    UnaryOperator::Indirection => todo!(),
+                    _ => op,
+                })
+            }
+            Expression::BinaryOperator(node) => {
+                let types = self
+                    .type_of_expr(&node.node.lhs.node)
+                    .zip(self.type_of_expr(&node.node.rhs.node));
+                let t = types.and_then(|(t1, t2)| Some(basic_type_promotion(&t1, &t2)));
+                t
+            }
+            _ => unreachable!("invalid or unsupported expr in sizeof, expr:{:?}", expr),
+        }
+    }
+
     /// utils end
 
     /// Enter a scope and create a new symbol table entry, i.e, we are at a `{` in the function.
@@ -709,18 +749,36 @@ impl IrgenFunc<'_> {
 
             // TODO: is it correct
             if let Some(initializer) = init_decl.node.initializer.as_ref() {
-                match &initializer.node {
-                    Initializer::Expression(node) => {
-                        let value = self.translate_expr(&node.node, false, context)?;
-                        // assign cast2: initialization
-                        let value = cast(value, &dtype, context);
-                        let inst = Instruction::Store {
-                            ptr,
-                            value: value.clone(),
-                        };
-                        let _ = context.insert_instruction(inst).unwrap();
-                    }
-                    Initializer::List(nodes) => todo!(),
+                self.translate_initializor(&dtype, &ptr, &initializer.node, context)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn translate_initializor(
+        &mut self,
+        dtype: &ir::Dtype,
+        ptr: &ir::Operand,
+        initializer: &Initializer,
+        context: &mut Context,
+    ) -> Result<(), IrgenError> {
+        match &initializer {
+            Initializer::Expression(node) => {
+                let value = self.translate_expr(&node.node, false, context)?;
+                // assign cast2: initialization
+                let value = cast(value, &dtype, context);
+                let inst = Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: value.clone(),
+                };
+                let _ = context.insert_instruction(inst).unwrap();
+            }
+            Initializer::List(nodes) => {
+                for item in nodes {
+                    let dtype = todo!();
+                    let ptr = todo!();
+                    self.translate_initializor(dtype, ptr, initializer, context)?;
+                    // let value = self.translate_expr(&item.node., not_deref, context)
                 }
             }
         }
@@ -1183,7 +1241,7 @@ impl IrgenFunc<'_> {
     fn translate_expr(
         &mut self,
         expr: &Expression,
-        not_deref: bool,
+        no_deref: bool,
         context: &mut Context,
     ) -> Result<ir::Operand, IrgenError> {
         // TODO: conditional expr
@@ -1198,7 +1256,7 @@ impl IrgenFunc<'_> {
                 // if it's the first access of the function argument
                 // store the value from function arg to local allocation slot
 
-                if !not_deref && (op.is_global() || op.is_alloc() || op.is_arg()) {
+                if !no_deref && (op.is_global() || op.is_alloc() || op.is_arg()) {
                     let load = Instruction::Load { ptr: op };
                     context.insert_instruction(load).unwrap()
                 } else {
@@ -1304,16 +1362,45 @@ impl IrgenFunc<'_> {
                 } else if matches!(&node.node.operator.node, BinaryOperator::Assign) {
                     let lhs = self.translate_expr(&node.node.lhs.node, true, context)?;
                     let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
-                    let lhs_ptr = self.get_orig_ptr(&node.node.lhs.node).unwrap();
-                    let dtype_ptr = lhs_ptr.dtype();
-                    let dtype = dtype_ptr.get_pointer_inner().cloned().unwrap();
+                    let dtype_ptr = lhs.dtype();
+                    let dtype = dtype_ptr.get_pointer_inner().cloned().unwrap_or(dtype_ptr);
                     let rhs = cast(rhs, &dtype, context);
                     let store = Instruction::Store {
-                        ptr: lhs_ptr,
+                        ptr: lhs,
                         value: rhs.clone(),
                     };
                     let _ = context.insert_instruction(store);
                     rhs
+                } else if matches!(&node.node.operator.node, BinaryOperator::Index) {
+                    // we have deref the array, so lhs.dtype() is element's type
+                    let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
+                    let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
+                    let index_dtype = ir::Dtype::int(64);
+                    let rhs = cast(rhs, &index_dtype, context);
+
+                    // dtype is a pointer to array
+                    let dtype = lhs.dtype();
+
+                    let (size, _) = dtype.index_dtype().size_align_of(self.structs).unwrap();
+                    let c = ir::Constant::int(size as _, ir::Dtype::int(64));
+                    let mul = Instruction::BinOp {
+                        op: BinaryOperator::Multiply,
+                        lhs: rhs,
+                        rhs: ir::Operand::constant(c),
+                        dtype: index_dtype,
+                    };
+                    let rhs = context.insert_instruction(mul).unwrap();
+
+                    let inst = Instruction::GetElementPtr {
+                        ptr: lhs,
+                        offset: rhs,
+                        dtype,
+                    };
+
+                    let op = context.insert_instruction(inst).unwrap();
+                    let array_type = op.dtype().get_pointer_inner().cloned().unwrap();
+                    let op = flatten_array(op, &array_type, context);
+                    op
                 } else {
                     let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
                     let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
@@ -1360,32 +1447,40 @@ impl IrgenFunc<'_> {
                     /// b_after_x:
                     ///     %is_nonzero = load tmp*
                     ///     br %is_nonzero b_y_nonzero,b_y_zero
-                    let res = match &node.node.operator.node {
-                        BinaryOperator::Index => {
-                            let inst = Instruction::GetElementPtr {
-                                ptr: lhs,
-                                offset: rhs,
-                                dtype,
-                            };
-                            context.insert_instruction(inst).unwrap()
-                        }
-                        _ => {
-                            let inst = Instruction::BinOp {
-                                op: node.node.operator.node.clone(),
-                                lhs,
-                                rhs,
-                                dtype,
-                            };
-                            context.insert_instruction(inst).unwrap()
-                        }
+                    let inst = Instruction::BinOp {
+                        op: node.node.operator.node.clone(),
+                        lhs,
+                        rhs,
+                        dtype,
                     };
-                    res
+                    context.insert_instruction(inst).unwrap()
                 }
             }
             Expression::Statement(node) => todo!(),
             Expression::StringLiteral(node) => todo!(),
             Expression::GenericSelection(node) => todo!(),
-            Expression::Member(node) => todo!(),
+            Expression::Member(node) => {
+                // TODO: make it readable
+                let struct_ptr = self.translate_expr(&node.node.expression.node, false, context)?;
+                let member = node.node.identifier.node.name.clone();
+                let dtype = struct_ptr.dtype();
+                let struct_dtype = dtype.get_pointer_inner().unwrap();
+                let struct_name = struct_dtype.get_struct_name().unwrap().clone().unwrap();
+                let struct_real_dtype = self.structs.get(&struct_name).unwrap().clone().unwrap();
+                let (offset, dtype) = struct_real_dtype
+                    .resolve_struct_field_offset(member.as_str(), self.structs)
+                    .unwrap();
+                let offset =
+                    ir::Operand::constant(ir::Constant::int(offset as _, ir::Dtype::int(64)));
+                let dtype = ir::Dtype::pointer(dtype);
+                let inst = Instruction::GetElementPtr {
+                    ptr: struct_ptr,
+                    offset,
+                    dtype: dtype.clone(),
+                };
+                let op = context.insert_instruction(inst).unwrap();
+                flatten_array(op, dtype.get_pointer_inner().unwrap(), context)
+            }
             Expression::Call(node) => {
                 // TODO: if callee is a function pointer
                 // callee can be either
@@ -1441,8 +1536,7 @@ impl IrgenFunc<'_> {
                 ))
             }
             Expression::SizeOfVal(node) => {
-                let res = self.translate_expr(&node.node.0.node, false, context)?;
-                let dtype = res.dtype();
+                let dtype = self.type_of_expr(&node.node.0.node).unwrap();
                 let (size, _) = dtype.size_align_of(&self.structs).unwrap();
                 ir::Operand::constant(ir::Constant::int(
                     size as _,
@@ -1841,23 +1935,25 @@ fn cast(orig: ir::Operand, target_dtype: &ir::Dtype, context: &mut Context) -> i
     }
 }
 
-// fn maybe_load_from_alloc(
-//     op: ir::Operand,
-//     context: &mut Context,
-// ) -> Either<(ir::Operand, ir::Operand), ir::Operand> {
-//     if let Some(rid) = op.local_rid().cloned() {
-//         let ptr = ir::Dtype::pointer(op.dtype());
-//         let ptr = ir::Operand::Register { rid, dtype: ptr };
-//         Either::Left((
-//             context
-//                 .insert_instruction(Instruction::Load { ptr: ptr.clone() })
-//                 .unwrap(),
-//             ptr,
-//         ))
-//     } else {
-//         Either::Right(op)
-//     }
-// }
+fn flatten_array(
+    op: ir::Operand,
+    array_type: &ir::Dtype,
+    context: &mut Context,
+) -> ir::Operand {
+    if let ir::Dtype::Array { inner, .. } = array_type {
+        // TODO: why is here i32 rather than i64 in `GetElementPtr` inst in other places?
+        let c = ir::Constant::int(0, ir::Dtype::int(32));
+        let inner_dtype = ir::Dtype::pointer(*inner.clone());
+        let inst = Instruction::GetElementPtr {
+            ptr: op,
+            offset: ir::Operand::constant(c),
+            dtype: inner_dtype,
+        };
+        context.insert_instruction(inst).unwrap()
+    } else {
+        op
+    }
+}
 
 fn type_size(t: &TypeSpecifier) -> Option<usize> {
     let r = match t {
@@ -1877,6 +1973,29 @@ fn type_size(t: &TypeSpecifier) -> Option<usize> {
     Some(r)
 }
 
+/// 1. one of them is float
+fn basic_type_promotion(l_type: &ir::Dtype, r_type: &ir::Dtype) -> ir::Dtype {
+    if l_type == r_type {
+        l_type.clone()
+    } else if l_type.is_int(None) && r_type.is_int(None) {
+        let l_size = l_type.get_int_width().unwrap();
+        let r_size = r_type.get_int_width().unwrap();
+        if l_size > r_size {
+            l_type.clone()
+        } else if l_size < r_size {
+            r_type.clone()
+        } else {
+            if l_type.is_int_signed() && !r_type.is_int_signed() {
+                r_type.clone()
+            } else {
+                l_type.clone()
+            }
+        }
+    } else {
+        unreachable!("unsupported type promotion, {:?}, {:?}", l_type, r_type)
+    }
+}
+
 fn type_align(t: &TypeSpecifier) -> Option<usize> {
     let r = match t {
         TypeSpecifier::Char => 1,
@@ -1893,10 +2012,6 @@ fn type_align(t: &TypeSpecifier) -> Option<usize> {
         _ => return None,
     };
     Some(r)
-}
-
-fn type_of_expr(expr: &Expression) -> Option<ir::Dtype> {
-    None
 }
 
 #[cfg(test)]

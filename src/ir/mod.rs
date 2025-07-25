@@ -1112,6 +1112,10 @@ impl<T> Named<T> {
     pub fn into_inner(self) -> T {
         self.inner
     }
+
+    pub fn inner(&self) -> &T{
+        &self.inner
+    }
 }
 
 impl<T: fmt::Display> fmt::Display for Named<T> {

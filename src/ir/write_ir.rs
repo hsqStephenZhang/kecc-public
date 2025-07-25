@@ -231,13 +231,14 @@ mod tests {
     #[test]
     fn test_writeir() -> io::Result<()> {
         let mut stdout = stdout();
-        let file = "foo4";
+        let file = "struct";
         let c_path = format!("{C_DIR}{file}.c");
         let ir_path = format!("{IR_DIR}{file}.ir");
         let c_file = Path::new(&c_path);
         let ir_file = Path::new(&ir_path);
 
         let parse = Parse {}.translate(&c_file).expect("parse failed");
+        // println!("{}", json!(parse));
 
         let ir = Irgen::default().translate(&parse).expect("irgen failed");
         writeln!(stdout, "ir gen by us:");
@@ -248,6 +249,7 @@ mod tests {
             .translate(&ir_file)
             .unwrap_or_else(|_| panic!("parse failed {}", ir_file.display()));
         assert!(unit.is_equiv(&ir));
+
         // writeln!(stdout, "\nir gen by ir parse:");
         // // writeln!(stdout, "{:?}", unit);
         // unit.write_line(0, &mut stdout)?;
