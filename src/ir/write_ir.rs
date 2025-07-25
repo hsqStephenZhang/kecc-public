@@ -231,14 +231,13 @@ mod tests {
     #[test]
     fn test_writeir() -> io::Result<()> {
         let mut stdout = stdout();
-        let file = "shift";
+        let file = "foo4";
         let c_path = format!("{C_DIR}{file}.c");
         let ir_path = format!("{IR_DIR}{file}.ir");
         let c_file = Path::new(&c_path);
         let ir_file = Path::new(&ir_path);
 
         let parse = Parse {}.translate(&c_file).expect("parse failed");
-        // println!("{}", json!(parse));
 
         let ir = Irgen::default().translate(&parse).expect("irgen failed");
         writeln!(stdout, "ir gen by us:");

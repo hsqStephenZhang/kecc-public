@@ -114,12 +114,6 @@ pub enum Dtype {
     },
 }
 
-// impl Dtype {
-//     pub fn pointer(dtype: Dtype) -> Self {
-//         Self::Pointer { inner: Box::new(dtype), is_const: false }
-//     }
-// }
-
 impl BaseDtype {
     /// Apply `StorageClassSpecifier` to `BaseDtype`.
     ///

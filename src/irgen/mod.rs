@@ -1140,7 +1140,7 @@ impl IrgenFunc<'_> {
             }
             Statement::Return(node) => {
                 if let Some(node) = node {
-                    let op = self.translate_expr(&node.node, false, context)?;
+                    let op = self.translate_expr(&node.node, true, context)?;
                     let op = if op.local_rid().is_some() {
                         let ptr = op.to_pointer().unwrap();
                         let load = Instruction::Load { ptr };
@@ -1339,7 +1339,7 @@ impl IrgenFunc<'_> {
                     ///
                     /// b_z...
                     ///     ...
-                    /// 
+                    ///
                     /// b_y_nonzero:
                     ///     ...
                     ///     jmp b_y_after
@@ -1388,14 +1388,16 @@ impl IrgenFunc<'_> {
             Expression::Member(node) => todo!(),
             Expression::Call(node) => {
                 // TODO: if callee is a function pointer
-                let Expression::Identifier(ident) = &node.node.callee.node else {
-                    unreachable!()
+                // callee can be either
+                // 1. a global variable of function
+                // 2. a function pointer
+                let callee = self.translate_expr(&node.node.callee.node, true, context)?;
+                let mut dtype = callee.dtype();
+                if let Some(inner) = dtype.get_pointer_inner() {
+                    dtype = inner.clone()
                 };
-                let callee = self.find_symbol(&ident.node.name).cloned().unwrap();
-                if let ir::Operand::Constant(c) = &callee
-                    && let ir::Constant::GlobalVariable { dtype, .. } = c
-                    && let ir::Dtype::Function { ret, params } = dtype
-                {
+
+                if let ir::Dtype::Function { ret, params } = &dtype {
                     let mut args = vec![];
                     assert_eq!(params.len(), node.node.arguments.len());
                     for (expr, target_dtype) in node.node.arguments.iter().zip(params) {
@@ -1413,7 +1415,7 @@ impl IrgenFunc<'_> {
                     };
                     context.insert_instruction(inst).unwrap()
                 } else {
-                    unreachable!("{callee}")
+                    unreachable!("{callee:?}")
                 }
             }
             Expression::CompoundLiteral(node) => todo!(),
