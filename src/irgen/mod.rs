@@ -1372,7 +1372,6 @@ impl IrgenFunc<'_> {
                     let _ = context.insert_instruction(store);
                     rhs
                 } else if matches!(&node.node.operator.node, BinaryOperator::Index) {
-                    // we have deref the array, so lhs.dtype() is element's type
                     let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
                     let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
                     let index_dtype = ir::Dtype::int(64);
@@ -1399,8 +1398,13 @@ impl IrgenFunc<'_> {
 
                     let op = context.insert_instruction(inst).unwrap();
                     let array_type = op.dtype().get_pointer_inner().cloned().unwrap();
-                    let op = flatten_array(op, &array_type, context);
-                    op
+                    if no_deref {
+                        op
+                    } else {
+                        // we are evaluating index expr, and no_deref is false,
+                        // so we should treat op as an ptr and load it (if it's not an array type)
+                        flatten_array(op, &array_type, context, true)
+                    }
                 } else {
                     let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
                     let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
@@ -1461,7 +1465,7 @@ impl IrgenFunc<'_> {
             Expression::GenericSelection(node) => todo!(),
             Expression::Member(node) => {
                 // TODO: make it readable
-                let struct_ptr = self.translate_expr(&node.node.expression.node, false, context)?;
+                let struct_ptr = self.translate_expr(&node.node.expression.node, true, context)?;
                 let member = node.node.identifier.node.name.clone();
                 let dtype = struct_ptr.dtype();
                 let struct_dtype = dtype.get_pointer_inner().unwrap();
@@ -1479,7 +1483,8 @@ impl IrgenFunc<'_> {
                     dtype: dtype.clone(),
                 };
                 let op = context.insert_instruction(inst).unwrap();
-                flatten_array(op, dtype.get_pointer_inner().unwrap(), context)
+                // should return ptr rather than the loaded value
+                flatten_array(op, dtype.get_pointer_inner().unwrap(), context, false)
             }
             Expression::Call(node) => {
                 // TODO: if callee is a function pointer
@@ -1939,6 +1944,7 @@ fn flatten_array(
     op: ir::Operand,
     array_type: &ir::Dtype,
     context: &mut Context,
+    should_load: bool,
 ) -> ir::Operand {
     if let ir::Dtype::Array { inner, .. } = array_type {
         // TODO: why is here i32 rather than i64 in `GetElementPtr` inst in other places?
@@ -1949,6 +1955,9 @@ fn flatten_array(
             offset: ir::Operand::constant(c),
             dtype: inner_dtype,
         };
+        context.insert_instruction(inst).unwrap()
+    } else if should_load {
+        let inst = Instruction::Load { ptr: op };
         context.insert_instruction(inst).unwrap()
     } else {
         op
