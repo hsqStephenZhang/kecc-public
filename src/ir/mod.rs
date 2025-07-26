@@ -495,40 +495,42 @@ impl Operand {
     }
 
     pub fn binop_dtype(&self, other: &Self, op: &ast::BinaryOperator) -> Option<Dtype> {
-        match op {
-            ast::BinaryOperator::Index => {
-                // self must be pointer type
-                // will return the deref-ed type
-                if let Operand::Register { dtype, .. } = self
-                    && let Dtype::Pointer { inner, .. } = dtype
-                {
-                    Some(*inner.clone())
-                } else {
-                    None
-                }
-            }
-            ast::BinaryOperator::Less
-            | ast::BinaryOperator::LessOrEqual
-            | ast::BinaryOperator::Greater
-            | ast::BinaryOperator::GreaterOrEqual
-            | ast::BinaryOperator::Equals
-            | ast::BinaryOperator::NotEquals
-            | ast::BinaryOperator::LogicalAnd
-            | ast::BinaryOperator::LogicalOr => {
-                if self.dtype() == other.dtype() {
-                    Some(Dtype::int(1).signed(false))
-                } else {
-                    None
-                }
-            }
-            _ => {
-                if self.dtype() == other.dtype() {
-                    Some(self.dtype())
-                } else {
-                    None
-                }
-            }
-        }
+        // match op {
+        //     ast::BinaryOperator::Index => {
+        //         // self must be pointer type
+        //         // will return the deref-ed type
+        //         if let Operand::Register { dtype, .. } = self
+        //             && let Dtype::Pointer { inner, .. } = dtype
+        //         {
+        //             Some(*inner.clone())
+        //         } else {
+        //             None
+        //         }
+        //     }
+        //     ast::BinaryOperator::Less
+        //     | ast::BinaryOperator::LessOrEqual
+        //     | ast::BinaryOperator::Greater
+        //     | ast::BinaryOperator::GreaterOrEqual
+        //     | ast::BinaryOperator::Equals
+        //     | ast::BinaryOperator::NotEquals
+        //     | ast::BinaryOperator::LogicalAnd
+        //     | ast::BinaryOperator::LogicalOr => {
+        //         if self.dtype() == other.dtype() {
+        //             Some(Dtype::int(1).signed(false))
+        //         } else {
+        //             None
+        //         }
+        //     }
+        //     _ => {
+        //         if self.dtype() == other.dtype() {
+        //             Some(self.dtype())
+        //         } else {
+        //             None
+        //         }
+        //     }
+        // }
+
+        todo!()
     }
 
     pub fn local_rid(&self) -> Option<&RegisterId> {
@@ -859,6 +861,8 @@ impl Constant {
     const OCTAL: u32 = 8;
     const HEXADECIMAL: u32 = 16;
     const BINARY: u32 = 2;
+
+    pub const ZERO_U1: Self = Self::Int { value: 0, width: 1, is_signed: false };
 
     #[inline]
     pub fn is_integer_constant(&self) -> bool {

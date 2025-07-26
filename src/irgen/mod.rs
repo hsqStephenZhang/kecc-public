@@ -511,6 +511,42 @@ struct IrgenFunc<'i> {
     symbol_table: Vec<HashMap<String, ir::Operand>>,
 }
 
+struct LogicNode {
+    // entry block id for the current logic subtree
+    entry: ir::BlockId,
+    // exit block for the current logic subtree
+    exit: Context,
+    // current value in the exit node
+    op: ir::Operand,
+}
+
+impl LogicNode {
+    fn connect(self, other: Self, irgen_func: &mut IrgenFunc<'_>) -> Self {
+        let Self { entry, exit, op } = self;
+        let Self {
+            entry: entry2,
+            exit: exit2,
+            op: op2,
+        } = other;
+        let arg_then = JumpArg::new(ir::BlockId(other.entry.0 - 2), vec![]);
+        let arg_else = JumpArg::new(ir::BlockId(other.entry.0 - 1), vec![]);
+
+        irgen_func.insert_block(
+            exit,
+            ir::BlockExit::ConditionalJump {
+                condition: op,
+                arg_then,
+                arg_else,
+            },
+        );
+        Self {
+            entry,
+            exit: exit2,
+            op: op2,
+        }
+    }
+}
+
 /// type cast: https://en.cppreference.com/w/c/language/conversion.html
 /// we implement the following cast rules:
 ///     1. Conversion as if by assignment
@@ -835,6 +871,7 @@ impl IrgenFunc<'_> {
             Statement::If(node) => {
                 let condition = &node.node.condition;
                 let op = self.translate_expr(&condition.node, true, context)?;
+                let op = op_to_cond(&node.node.condition.node, op, context);
 
                 let mut ctx_then = Context::new(self.alloc_bid());
                 let mut ctx_else = Context::new(self.alloc_bid());
@@ -985,6 +1022,7 @@ impl IrgenFunc<'_> {
 
                 // 1. cond
                 let op = self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
+                let op = op_to_cond(&node.node.expression.node, op, context);
                 let exit = ir::BlockExit::ConditionalJump {
                     condition: op,
                     arg_then: jmp_body.clone(),
@@ -1061,6 +1099,7 @@ impl IrgenFunc<'_> {
 
                 // 2. cond
                 let op = self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
+                let op = op_to_cond(&node.node.expression.node, op, context);
                 let exit = ir::BlockExit::ConditionalJump {
                     condition: op,
                     arg_then: jmp_body.clone(),
@@ -1133,6 +1172,7 @@ impl IrgenFunc<'_> {
                 // 2. cond
                 if let Some(cond) = &node.node.condition {
                     let op = self.translate_expr(&cond.node, true, &mut ctx_cond)?;
+                    let op = op_to_cond(&cond.node, op, context);
                     let exit = ir::BlockExit::ConditionalJump {
                         condition: op,
                         arg_then: jmp_body.clone(),
@@ -1199,9 +1239,8 @@ impl IrgenFunc<'_> {
             Statement::Return(node) => {
                 if let Some(node) = node {
                     let op = self.translate_expr(&node.node, true, context)?;
-                    let op = if op.local_rid().is_some() {
-                        let ptr = op.to_pointer().unwrap();
-                        let load = Instruction::Load { ptr };
+                    let op = if op.is_alloc() || op.is_arg() {
+                        let load = Instruction::Load { ptr: op };
                         context.insert_instruction(load).unwrap()
                     } else {
                         op
@@ -1232,6 +1271,114 @@ impl IrgenFunc<'_> {
             }
             _ => None,
         }
+    }
+
+    // TODO: logical or
+    fn translate_logic_expr(
+        &mut self,
+        collects: &[&Expression],
+        operators: &[BinaryOperator],
+        context: &mut Context,
+    ) -> Result<ir::Operand, IrgenError> {
+        assert_eq!(collects.len(), operators.len() + 1);
+        let dtype = ir::Dtype::BOOL;
+        let mut tmps = vec![];
+        for i in 0..operators.len() {
+            let name = self.alloc_tempid();
+            let named = Named::new(Some(name.clone()), dtype.clone());
+            let rid = self.insert_alloc(named.clone());
+            let ptr = ir::Operand::Register {
+                rid,
+                dtype: ir::Dtype::pointer(dtype.clone()),
+            };
+            tmps.push(ptr);
+        }
+        // will skip the first expression
+
+        let mut exit_info = None;
+        let mut next_jmp = None;
+        for ((ptr, op), expr) in tmps
+            .into_iter()
+            .rev()
+            .zip(operators.iter().rev())
+            .zip(collects.iter().rev())
+        {
+            let mut c1 = Context::new(self.alloc_bid());
+            let mut c2 = Context::new(self.alloc_bid());
+            let mut c3 = Context::new(self.alloc_bid());
+            let bid1 = c1.bid;
+            let jmp_v3 = JumpArg::new(c3.bid, vec![]);
+
+            let op = self.translate_expr(expr, false, &mut c1)?;
+            let op = cast(op, &dtype, &mut c1);
+            c1.insert_instruction(Instruction::Store {
+                ptr: ptr.clone(),
+                value: op,
+            });
+
+            let zero = ir::Operand::constant(ir::Constant::ZERO_U1);
+            c2.insert_instruction(Instruction::Store {
+                ptr: ptr.clone(),
+                value: zero,
+            });
+
+            self.insert_block(
+                c1,
+                ir::BlockExit::Jump {
+                    arg: jmp_v3.clone(),
+                },
+            );
+            self.insert_block(
+                c2,
+                ir::BlockExit::Jump {
+                    arg: jmp_v3.clone(),
+                },
+            );
+            let op = c3
+                .insert_instruction(Instruction::Load { ptr: ptr.clone() })
+                .unwrap();
+
+            match next_jmp.clone() {
+                Some(jmp) => {
+                    let arg_then = JumpArg::new(ir::BlockId(jmp), vec![]);
+                    let arg_else = JumpArg::new(ir::BlockId(jmp + 1), vec![]);
+
+                    self.insert_block(
+                        c3,
+                        ir::BlockExit::ConditionalJump {
+                            condition: op,
+                            arg_then,
+                            arg_else,
+                        },
+                    );
+                }
+                None => {
+                    // will only assign once
+                    exit_info = Some((c3, op));
+                }
+            }
+
+            next_jmp = Some(bid1.0);
+        }
+
+        // now evaluate the first expr, and switch to exit_block
+
+        let jmp = next_jmp.unwrap();
+        let (mut exit, op) = exit_info.unwrap();
+        let lhs = self.translate_expr(collects[0], false, context)?;
+        let lhs = cast(lhs, &ir::Dtype::BOOL, context);
+        mem::swap(context, &mut exit);
+        let arg_then = JumpArg::new(ir::BlockId(jmp), vec![]);
+        let arg_else = JumpArg::new(ir::BlockId(jmp + 1), vec![]);
+        self.insert_block(
+            exit,
+            ir::BlockExit::ConditionalJump {
+                condition: lhs,
+                arg_then,
+                arg_else,
+            },
+        );
+        Ok(op)
     }
 
     /// translate expr, will walk the expr tree in post order
@@ -1405,52 +1552,25 @@ impl IrgenFunc<'_> {
                         // so we should treat op as an ptr and load it (if it's not an array type)
                         flatten_array(op, &array_type, context, true)
                     }
+                } else if matches!(&node.node.operator.node, BinaryOperator::LogicalAnd)
+                    || matches!(&node.node.operator.node, BinaryOperator::LogicalOr)
+                {
+                    let mut leaf_nodes = vec![];
+                    let mut operators = vec![];
+                    collect_logic_leaf_expr(expr, &mut leaf_nodes, &mut operators);
+                    self.translate_logic_expr(&leaf_nodes, &operators, context)?
                 } else {
                     let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
                     let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
-                    let mut rhs = rhs;
-                    let dtype = match lhs.binop_dtype(&rhs, &node.node.operator.node) {
-                        Some(dtype) => dtype,
-                        None => {
-                            let cast = Instruction::TypeCast {
-                                value: rhs,
-                                target_dtype: lhs.dtype(),
-                            };
-                            rhs = context.insert_instruction(cast).unwrap();
-                            lhs.binop_dtype(&rhs, &node.node.operator.node).unwrap()
-                        }
-                    };
+                    let operand_dtype = lhs
+                        .dtype()
+                        .binop_dtype(&rhs.dtype(), &node.node.operator.node)
+                        .unwrap();
 
-                    /// x && y && z
-                    ///
-                    /// b_current:
-                    ///     %value_x = eval x
-                    ///     %cmp_x = cmp eq %value_x 0 (if value_x is not bit type)
-                    ///     %br %cmp_x b_x_nonzero,b_x_zero
-                    ///
-                    /// b_z...
-                    ///     ...
-                    ///
-                    /// b_y_nonzero:
-                    ///     ...
-                    ///     jmp b_y_after
-                    /// b_y_zero:
-                    ///     ...
-                    ///     jmp b_y_after
-                    /// b_y_after:
-                    ///     ...
-                    ///
-                    /// b_x_nonzero:
-                    ///     %value_x = eval x
-                    ///     %cmp_x = cmp eq %value_x 0
-                    ///     store %cmp_x tmp*
-                    ///     jmp b_after_x
-                    /// b_x_zero:
-                    ///     store %0 tmp*
-                    ///     jmp b_after_x
-                    /// b_after_x:
-                    ///     %is_nonzero = load tmp*
-                    ///     br %is_nonzero b_y_nonzero,b_y_zero
+                    let lhs = cast(lhs, &operand_dtype, context);
+                    let rhs = cast(rhs, &operand_dtype, context);
+                    let dtype = binop_dtype(&operand_dtype, &node.node.operator.node);
+
                     let inst = Instruction::BinOp {
                         op: node.node.operator.node.clone(),
                         lhs,
@@ -1507,7 +1627,6 @@ impl IrgenFunc<'_> {
                         args.push(op);
                     }
 
-                    // let callee = self.translate_expr(&node.node.callee.node, false, context)?;
                     let inst = Instruction::Call {
                         callee: callee.clone(),
                         args,
@@ -1587,6 +1706,7 @@ impl IrgenFunc<'_> {
             ///     after
             Expression::Conditional(node) => {
                 let op = self.translate_expr(&node.node.condition.node, false, context)?;
+                let op = op_to_cond(&node.node.condition.node, op, context);
 
                 let mut ctx_then = Context::new(self.alloc_bid());
                 let mut ctx_else = Context::new(self.alloc_bid());
@@ -1940,6 +2060,86 @@ fn cast(orig: ir::Operand, target_dtype: &ir::Dtype, context: &mut Context) -> i
     }
 }
 
+fn op_to_cond(expr: &Expression, orig: ir::Operand, context: &mut Context) -> ir::Operand {
+    // 1. cast to int first
+    let op = if !matches!(orig.dtype(), ir::Dtype::Int { .. }) {
+        cast(orig, &ir::Dtype::int(32), context)
+    } else {
+        orig
+    };
+
+    // 2. cmp with int zero(of the same width)
+    if let ir::Dtype::Int { width, .. } = op.dtype()
+        && width != 1
+    {
+        let zero = ir::Constant::int(0, ir::Dtype::int(width));
+        let cmp = Instruction::BinOp {
+            op: BinaryOperator::NotEquals,
+            lhs: op,
+            rhs: ir::Operand::constant(zero),
+            dtype: ir::Dtype::BOOL,
+        };
+        context.insert_instruction(cmp).unwrap()
+    } else {
+        op
+    }
+}
+
+fn is_simple_expr(expr: &Expression) -> bool {
+    match expr {
+        Expression::Identifier(..)
+        | Expression::Constant(..)
+        | Expression::StringLiteral(..)
+        | Expression::SizeOfTy(..)
+        | Expression::SizeOfVal(..)
+        | Expression::AlignOf(..)
+        | Expression::Comma(..)
+        | Expression::OffsetOf(..) => true,
+        _ => false,
+    }
+}
+
+fn binop_dtype(operand_dtype: &ir::Dtype, operator: &BinaryOperator) -> ir::Dtype {
+    match operator {
+        BinaryOperator::Less
+        | BinaryOperator::Greater
+        | BinaryOperator::LessOrEqual
+        | BinaryOperator::GreaterOrEqual
+        | BinaryOperator::Equals
+        | BinaryOperator::NotEquals => ir::Dtype::BOOL,
+
+        // arithmatic
+        BinaryOperator::Multiply
+        | BinaryOperator::Divide
+        | BinaryOperator::Modulo
+        | BinaryOperator::Plus
+        | BinaryOperator::Minus
+        | BinaryOperator::ShiftLeft
+        | BinaryOperator::ShiftRight
+        | BinaryOperator::AssignMultiply
+        | BinaryOperator::AssignDivide
+        | BinaryOperator::AssignModulo
+        | BinaryOperator::AssignPlus
+        | BinaryOperator::AssignMinus
+        | BinaryOperator::AssignShiftLeft
+        | BinaryOperator::AssignShiftRight
+        | BinaryOperator::AssignBitwiseAnd
+        | BinaryOperator::AssignBitwiseXor
+        | BinaryOperator::AssignBitwiseOr => operand_dtype.clone(),
+
+        BinaryOperator::BitwiseAnd
+        | BinaryOperator::BitwiseXor
+        | BinaryOperator::BitwiseOr => ir::Dtype::int(32),
+
+        BinaryOperator::Assign => ir::Dtype::unit(),
+
+        // should not be called
+        BinaryOperator::Index => todo!(),
+        BinaryOperator::LogicalAnd => todo!(),
+        BinaryOperator::LogicalOr => todo!(),
+    }
+}
+
 fn flatten_array(
     op: ir::Operand,
     array_type: &ir::Dtype,
@@ -2021,6 +2221,23 @@ fn type_align(t: &TypeSpecifier) -> Option<usize> {
         _ => return None,
     };
     Some(r)
+}
+
+fn collect_logic_leaf_expr<'a>(
+    expr: &'a Expression,
+    collects: &mut Vec<&'a Expression>,
+    operations: &mut Vec<BinaryOperator>,
+) {
+    if let Expression::BinaryOperator(node) = &expr
+        && (node.node.operator.node == BinaryOperator::LogicalAnd
+            || node.node.operator.node == BinaryOperator::LogicalOr)
+    {
+        collect_logic_leaf_expr(&node.node.lhs.node, collects, operations);
+        collect_logic_leaf_expr(&node.node.rhs.node, collects, operations);
+        operations.push(node.node.operator.node.clone());
+    } else {
+        collects.push(expr);
+    }
 }
 
 #[cfg(test)]
