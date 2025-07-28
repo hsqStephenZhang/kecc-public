@@ -6,6 +6,7 @@ mod interp;
 mod parse;
 mod visualize;
 mod write_ir;
+mod type_system;
 
 use core::convert::TryFrom;
 use core::fmt;
@@ -542,23 +543,6 @@ impl Operand {
         None
     }
 
-    pub fn to_pointer(&self) -> Option<Self> {
-        if let Self::Register { rid, dtype } = self {
-            let ptr = Dtype::pointer(dtype.clone());
-            let ptr = Self::Register {
-                rid: *rid,
-                dtype: ptr,
-            };
-            Some(ptr)
-        } else if let Self::Constant(constant) = self
-            && let Constant::GlobalVariable { .. } = constant
-        {
-            Some(self.clone())
-        } else {
-            None
-        }
-    }
-
     pub fn is_global(&self) -> bool {
         if let Self::Constant(constant) = self
             && let Constant::GlobalVariable { .. } = constant
@@ -863,6 +847,7 @@ impl Constant {
     const BINARY: u32 = 2;
 
     pub const ZERO_U1: Self = Self::Int { value: 0, width: 1, is_signed: false };
+    pub const ONE_U1: Self = Self::Int { value: 1, width: 1, is_signed: false };
 
     #[inline]
     pub fn is_integer_constant(&self) -> bool {

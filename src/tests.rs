@@ -124,6 +124,8 @@ pub fn test_irgen(path: &Path) {
     let new_c = modify_c(path, rand_num);
     modify_ir(&mut ir, rand_num);
 
+    println!("{}", new_c);
+
     // compile recolved c example
     let temp_dir = tempdir().expect("temp dir creation failed");
     let temp_file_path = temp_dir.path().join("temp.c");

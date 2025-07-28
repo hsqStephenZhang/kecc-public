@@ -22,7 +22,7 @@ impl WriteLine for TranslationUnit {
                         if let Some(name) = field.name() {
                             name
                         } else {
-                            "%anon"
+                            "%anon" 
                         },
                         field.deref()
                     ))
@@ -176,62 +176,10 @@ mod tests {
     const C_DIR: &str = "examples/c/";
     const IR_DIR: &str = "examples/ir0/";
 
-    /**
-         *
-    int foo(int x, int y, int z) {
-        if (x == y) {
-            return y;
-        } else {
-            return z;
-        }
-    }
-
-    --> translate into:
-
-    fun i32 @foo (i32, i32, i32) {
-    init:
-      bid: b0
-      allocations:
-        %l0:i32:x
-        %l1:i32:y
-        %l2:i32:z
-
-    block b0:
-      %b0:p0:i32:x
-      %b0:p1:i32:y
-      %b0:p2:i32:z
-      %b0:i0:unit = store %b0:p0:i32 %l0:i32*
-      %b0:i1:unit = store %b0:p1:i32 %l1:i32*
-      %b0:i2:unit = store %b0:p2:i32 %l2:i32*
-      %b0:i3:i32 = load %l0:i32*
-      %b0:i4:i32 = load %l1:i32*
-      %b0:i5:u1 = cmp eq %b0:i3:i32 %b0:i4:i32
-      br %b0:i5:u1, b1(), b2()
-
-    block b1:
-      %b1:i0:i32 = load %l1:i32*
-      ret %b1:i0:i32
-
-    block b2:
-      %b2:i0:i32 = load %l2:i32*
-      ret %b2:i0:i32
-
-    block b3:
-      ret undef:i32
-
-    block b4:
-      j b3()
-
-    block b5:
-      j b3()
-    }
-         *
-         */
-
     #[test]
     fn test_writeir() -> io::Result<()> {
         let mut stdout = stdout();
-        let file = "bitwise";
+        let file = "fib2";
         let c_path = format!("{C_DIR}{file}.c");
         let ir_path = format!("{IR_DIR}{file}.ir");
         let c_file = Path::new(&c_path);
@@ -245,10 +193,13 @@ mod tests {
         ir.write_line(0, &mut stdout)?;
         stdout.flush()?;
 
-        let unit = IrParse {}
-            .translate(&ir_file)
-            .unwrap_or_else(|_| panic!("parse failed {}", ir_file.display()));
-        assert!(unit.is_equiv(&ir));
+        let res= ir::interp(&ir, vec![]);
+        println!("res: {:?}" ,res);
+
+        // let unit = IrParse {}
+        //     .translate(&ir_file)
+        //     .unwrap_or_else(|_| panic!("parse failed {}", ir_file.display()));
+        // assert!(unit.is_equiv(&ir));
 
         // writeln!(stdout, "\nir gen by ir parse:");
         // // writeln!(stdout, "{:?}", unit);

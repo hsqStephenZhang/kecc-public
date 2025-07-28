@@ -561,6 +561,12 @@ impl Dtype {
     /// TODO(document)
     pub const INT: Self = Self::int(Self::SIZE_OF_INT * Self::BITS_OF_BYTE);
 
+    pub const U_INT: Self = Self::Int {
+        width: Self::SIZE_OF_INT * Self::BITS_OF_BYTE,
+        is_signed: false,
+        is_const: false,
+    };
+
     /// TODO(document)
     pub const LONG: Self = Self::int(Self::SIZE_OF_LONG * Self::BITS_OF_BYTE);
 
@@ -1415,85 +1421,48 @@ impl Dtype {
         }
     }
 
-    pub fn binop_dtype(&self, other: &Self, binop: &ast::BinaryOperator) -> Option<Self> {
+    pub fn binop_dtype(&self, r_type: &Self, binop: &ast::BinaryOperator) -> Option<(Self, Self)> {
+        // 1. bitwise conversion to i32
         match binop {
             ast::BinaryOperator::BitwiseAnd
             | ast::BinaryOperator::BitwiseXor
-            | ast::BinaryOperator::BitwiseOr => return Some(Dtype::int(32)),
-            _ => {}
-        }
-        match (self, other) {
-            // Int + Int
-            // will take the max width
-            (
-                Self::Int {
-                    width, is_signed, ..
-                },
-                Self::Int {
-                    width: width1,
-                    is_signed: is_signed2,
-                    ..
-                },
-            ) => {
-                let width = *width.max(width1);
-                // **dirty job** for passing the tests
-                if width < 32 {
-                    match binop {
-                        ast::BinaryOperator::Less
-                        | ast::BinaryOperator::Greater
-                        | ast::BinaryOperator::LessOrEqual
-                        | ast::BinaryOperator::GreaterOrEqual
-                        | ast::BinaryOperator::Equals
-                        | ast::BinaryOperator::NotEquals => {
-                            return Some(Self::Int {
-                                width: 32,
-                                is_signed: true,
-                                is_const: false,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
+            | ast::BinaryOperator::BitwiseOr => return Some((Self::INT, Self::INT)),
+            ast::BinaryOperator::Multiply
+            | ast::BinaryOperator::Divide
+            | ast::BinaryOperator::Modulo
+            | ast::BinaryOperator::Plus
+            | ast::BinaryOperator::Minus => {
+                todo!("arithmatic conversion by priority")
+            },
+            ast::BinaryOperator::Assign
+            | ast::BinaryOperator::AssignMultiply
+            | ast::BinaryOperator::AssignDivide
+            | ast::BinaryOperator::AssignModulo
+            | ast::BinaryOperator::AssignPlus
+            | ast::BinaryOperator::AssignMinus
+            | ast::BinaryOperator::AssignShiftLeft
+            | ast::BinaryOperator::AssignShiftRight
+            | ast::BinaryOperator::AssignBitwiseAnd
+            | ast::BinaryOperator::AssignBitwiseXor
+            | ast::BinaryOperator::AssignBitwiseOr => return Some((self.clone(), self.clone())),
 
-                let is_signed = *is_signed || *is_signed2;
-                Some(Self::Int {
-                    width,
-                    is_signed,
-                    is_const: false,
-                })
+            ast::BinaryOperator::ShiftLeft | ast::BinaryOperator::ShiftRight => todo!(),
+
+            ast::BinaryOperator::Less
+            | ast::BinaryOperator::Greater
+            | ast::BinaryOperator::LessOrEqual
+            | ast::BinaryOperator::GreaterOrEqual
+            | ast::BinaryOperator::Equals
+            | ast::BinaryOperator::NotEquals => {
+                // logical
+                return Some((Self::INT, Self::BOOL))
             }
-            // Float + Float
-            // will take max width
-            (Self::Float { width, .. }, Self::Float { width: width1, .. }) => Some(Self::Float {
-                width: *width.max(width1),
-                is_const: false,
-            }),
-            // Float + Int / Int + Float
-            // will return the float type
-            (Self::Float { width, .. }, Self::Int { width: width1, .. })
-            | (Self::Int { width, .. }, Self::Float { width: width1, .. }) => Some(Self::Float {
-                width: *width,
-                is_const: false,
-            }),
-            // Pointer + Int / Int + Poiner
-            (Self::Pointer { inner, .. }, Self::Int { width, .. })
-            | (Self::Int { width, .. }, Self::Pointer { inner, .. }) => Some(Self::Pointer {
-                inner: inner.clone(),
-                is_const: false,
-            }),
-            (Self::Pointer { inner, .. }, Self::Pointer { inner: inner2, .. }) => {
-                if inner == inner2 {
-                    Some(Self::Int {
-                        width: 64,
-                        is_signed: true,
-                        is_const: false,
-                    })
-                } else {
-                    None
-                }
-            }
-            _ => todo!(),
+
+            ast::BinaryOperator::Index => todo!(),
+            ast::BinaryOperator::LogicalAnd => todo!(),
+            ast::BinaryOperator::LogicalOr => todo!(),
         }
+        
     }
 }
 

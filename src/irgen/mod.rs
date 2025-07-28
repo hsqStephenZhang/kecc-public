@@ -485,6 +485,11 @@ impl Context {
     }
 }
 
+trait OpExt {
+    fn with_load(self, should_load: bool, context: &mut Context) -> ir::Operand;
+    fn with_cast(self, target_dtype: &ir::Dtype, context: &mut Context) -> ir::Operand;
+}
+
 /// A C function being translated.
 struct IrgenFunc<'i> {
     /// return type of the function.
@@ -548,11 +553,13 @@ impl LogicNode {
 }
 
 /// type cast: https://en.cppreference.com/w/c/language/conversion.html
-/// we implement the following cast rules:
-///     1. Conversion as if by assignment
-///     2. Usual arithmetic conversions
-///         a. one of operands is float
-///         b. ...
+/// left value in c:
+///     1. identifier: x
+///     2. index of array: arr[i]
+///     3. member: a->member/a.member
+///     4. deref pointer(it could be anything): -> *x
+///     5. assignment
+///     6. initial value
 impl IrgenFunc<'_> {
     /// Allocate a new block id.
     fn alloc_bid(&mut self) -> ir::BlockId {
@@ -569,6 +576,10 @@ impl IrgenFunc<'_> {
     }
 
     /// Create a new allocation with type given by `alloc`.
+    /// we alloc for:
+    ///     1. global/local vars
+    ///     2. temperal vars during conditional expression evaluation
+    ///     3. temperal vars durign logical expression evaluation
     fn insert_alloc(&mut self, alloc: Named<ir::Dtype>) -> ir::RegisterId {
         self.allocations.push(alloc);
         let id = self.allocations.len() - 1;
@@ -643,12 +654,17 @@ impl IrgenFunc<'_> {
             Expression::UnaryOperator(node) => {
                 let op = self.type_of_expr(&node.node.operand.node);
                 op.map(|op| match &node.node.operator.node {
-                    UnaryOperator::Address => {
-                        todo!()
+                    UnaryOperator::Address => Some(ir::Dtype::pointer(op)),
+                    UnaryOperator::Indirection => {
+                        if let Some(ptr) = op.get_pointer_inner() {
+                            Some(ptr.clone())
+                        } else {
+                            None
+                        }
                     }
-                    UnaryOperator::Indirection => todo!(),
-                    _ => op,
+                    _ => Some(op),
                 })
+                .unwrap_or_default()
             }
             Expression::BinaryOperator(node) => {
                 let types = self
@@ -800,12 +816,12 @@ impl IrgenFunc<'_> {
     ) -> Result<(), IrgenError> {
         match &initializer {
             Initializer::Expression(node) => {
-                let value = self.translate_expr(&node.node, false, context)?;
+                let (op, _) = self.translate_expr(&node.node, false, context)?;
                 // assign cast2: initialization
-                let value = cast(value, &dtype, context);
+                let op = cast(op, &dtype, context);
                 let inst = Instruction::Store {
                     ptr: ptr.clone(),
-                    value: value.clone(),
+                    value: op.clone(),
                 };
                 let _ = context.insert_instruction(inst).unwrap();
             }
@@ -870,7 +886,7 @@ impl IrgenFunc<'_> {
             ///     ...
             Statement::If(node) => {
                 let condition = &node.node.condition;
-                let op = self.translate_expr(&condition.node, true, context)?;
+                let (op, _) = self.translate_expr(&condition.node, true, context)?;
                 let op = op_to_cond(&node.node.condition.node, op, context);
 
                 let mut ctx_then = Context::new(self.alloc_bid());
@@ -931,7 +947,7 @@ impl IrgenFunc<'_> {
             /// we only support switch stmt with default case
             /// and all case shall be constant expr
             Statement::Switch(node) => {
-                let op = self.translate_expr(&node.node.expression.node, false, context)?;
+                let (op, _) = self.translate_expr(&node.node.expression.node, false, context)?;
                 let mut b_after = Context::new(self.alloc_bid());
                 let bid_after = b_after.bid;
                 let jmp_arg = JumpArg::new(bid_after, vec![]);
@@ -1021,7 +1037,8 @@ impl IrgenFunc<'_> {
                 );
 
                 // 1. cond
-                let op = self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
+                let (op, _) =
+                    self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
                 let op = op_to_cond(&node.node.expression.node, op, context);
                 let exit = ir::BlockExit::ConditionalJump {
                     condition: op,
@@ -1098,7 +1115,8 @@ impl IrgenFunc<'_> {
                 self.exit_scope();
 
                 // 2. cond
-                let op = self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
+                let (op, _) =
+                    self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
                 let op = op_to_cond(&node.node.expression.node, op, context);
                 let exit = ir::BlockExit::ConditionalJump {
                     condition: op,
@@ -1171,7 +1189,7 @@ impl IrgenFunc<'_> {
 
                 // 2. cond
                 if let Some(cond) = &node.node.condition {
-                    let op = self.translate_expr(&cond.node, true, &mut ctx_cond)?;
+                    let (op, _) = self.translate_expr(&cond.node, true, &mut ctx_cond)?;
                     let op = op_to_cond(&cond.node, op, context);
                     let exit = ir::BlockExit::ConditionalJump {
                         condition: op,
@@ -1238,13 +1256,7 @@ impl IrgenFunc<'_> {
             }
             Statement::Return(node) => {
                 if let Some(node) = node {
-                    let op = self.translate_expr(&node.node, true, context)?;
-                    let op = if op.is_alloc() || op.is_arg() {
-                        let load = Instruction::Load { ptr: op };
-                        context.insert_instruction(load).unwrap()
-                    } else {
-                        op
-                    };
+                    let (op, _) = self.translate_expr(&node.node, false, context)?;
                     let return_type = self.return_type.clone();
                     // assign cast4: return
                     let value = cast(op, &return_type, context);
@@ -1259,20 +1271,6 @@ impl IrgenFunc<'_> {
         Ok(())
     }
 
-    fn get_orig_ptr(&mut self, expr: &Expression) -> Option<ir::Operand> {
-        match expr {
-            Expression::Identifier(node) => {
-                let value = self.find_symbol(&node.node.name).cloned();
-                let op = match value {
-                    Some(op) => op,
-                    None => panic!("{}, symbol table: {:?}", json!(expr), self.symbol_table),
-                };
-                Some(op)
-            }
-            _ => None,
-        }
-    }
-
     // TODO: logical or
     fn translate_logic_expr(
         &mut self,
@@ -1280,6 +1278,11 @@ impl IrgenFunc<'_> {
         operators: &[BinaryOperator],
         context: &mut Context,
     ) -> Result<ir::Operand, IrgenError> {
+        debug_assert!(
+            operators
+                .iter()
+                .all(|op| [BinaryOperator::LogicalOr, BinaryOperator::LogicalAnd].contains(op))
+        );
         assert_eq!(collects.len(), operators.len() + 1);
         let dtype = ir::Dtype::BOOL;
         let mut tmps = vec![];
@@ -1295,6 +1298,16 @@ impl IrgenFunc<'_> {
         }
         // will skip the first expression
 
+        // we generate the logical tree in the following order
+        //       and
+        //      /   \
+        //     and  z
+        //     /\
+        //    x  y
+        // then the order is z1, z2, z3, y1, y2, y3
+        // and z3 is the exit node,
+        // x is the entry expression(we will not generate node for this expr)
+
         let mut exit_info = None;
         let mut next_jmp = None;
         for ((ptr, op), expr) in tmps
@@ -1309,18 +1322,33 @@ impl IrgenFunc<'_> {
             let bid1 = c1.bid;
             let jmp_v3 = JumpArg::new(c3.bid, vec![]);
 
-            let op = self.translate_expr(expr, false, &mut c1)?;
-            let op = cast(op, &dtype, &mut c1);
-            c1.insert_instruction(Instruction::Store {
-                ptr: ptr.clone(),
-                value: op,
-            });
+            if op == &BinaryOperator::LogicalAnd {
+                let (op, _) = self.translate_expr(expr, false, &mut c1)?;
+                let op = cast(op, &dtype, &mut c1);
+                c1.insert_instruction(Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: op,
+                });
 
-            let zero = ir::Operand::constant(ir::Constant::ZERO_U1);
-            c2.insert_instruction(Instruction::Store {
-                ptr: ptr.clone(),
-                value: zero,
-            });
+                let zero = ir::Operand::constant(ir::Constant::ZERO_U1);
+                c2.insert_instruction(Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: zero,
+                });
+            } else {
+                let one = ir::Operand::constant(ir::Constant::ONE_U1);
+                c1.insert_instruction(Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: one,
+                });
+
+                let (op, _) = self.translate_expr(expr, false, &mut c2)?;
+                let op = cast(op, &dtype, &mut c2);
+                c2.insert_instruction(Instruction::Store {
+                    ptr: ptr.clone(),
+                    value: op,
+                });
+            }
 
             self.insert_block(
                 c1,
@@ -1334,6 +1362,7 @@ impl IrgenFunc<'_> {
                     arg: jmp_v3.clone(),
                 },
             );
+
             let op = c3
                 .insert_instruction(Instruction::Load { ptr: ptr.clone() })
                 .unwrap();
@@ -1353,7 +1382,6 @@ impl IrgenFunc<'_> {
                     );
                 }
                 None => {
-                    // will only assign once
                     exit_info = Some((c3, op));
                 }
             }
@@ -1365,7 +1393,7 @@ impl IrgenFunc<'_> {
 
         let jmp = next_jmp.unwrap();
         let (mut exit, op) = exit_info.unwrap();
-        let lhs = self.translate_expr(collects[0], false, context)?;
+        let (lhs, _) = self.translate_expr(collects[0], false, context)?;
         let lhs = cast(lhs, &ir::Dtype::BOOL, context);
         mem::swap(context, &mut exit);
         let arg_then = JumpArg::new(ir::BlockId(jmp), vec![]);
@@ -1381,146 +1409,130 @@ impl IrgenFunc<'_> {
         Ok(op)
     }
 
-    /// translate expr, will walk the expr tree in post order
-    /// ```C
-    ///    a = b + c * d;
-    /// ```
-    fn translate_expr(
+    // lvalue in unary operator:
+    //      4. deref pointer(it could be anything): -> *x
+    fn translate_unary_expr(
         &mut self,
-        expr: &Expression,
+        expr: &UnaryOperatorExpression,
         no_deref: bool,
         context: &mut Context,
-    ) -> Result<ir::Operand, IrgenError> {
-        // TODO: conditional expr
-        let op = match expr {
-            Expression::Identifier(node) => {
-                let value = self.find_symbol(&node.node.name).cloned();
-                let op = match value {
-                    Some(op) => op,
-                    None => panic!("{}, symbol table: {:?}", json!(expr), self.symbol_table),
-                };
-                // TODO: when shall we load the value from allocation?
-                // if it's the first access of the function argument
-                // store the value from function arg to local allocation slot
-
-                if !no_deref && (op.is_global() || op.is_alloc() || op.is_arg()) {
-                    let load = Instruction::Load { ptr: op };
-                    context.insert_instruction(load).unwrap()
-                } else {
-                    op
+    ) -> Result<(ir::Operand, Option<ir::Operand>), IrgenError> {
+        let (op, ptr) = if let Some((is_pre, bin_op)) = is_unary_assign(&expr.operator.node) {
+            // a++, a--, ++a, --a
+            // we need lvalue here
+            // TODO: can we handle pointer++
+            let (op, lvalue) = self.translate_expr(&expr.operand.node, false, context)?;
+            let dtype = op.dtype();
+            let op_after_update = context
+                .insert_instruction(Instruction::BinOp {
+                    op: bin_op,
+                    lhs: op.clone(),
+                    rhs: ir::Operand::Constant(ir::Constant::int(1, dtype.clone())),
+                    dtype: dtype.clone(),
+                })
+                .unwrap();
+            let _ = context.insert_instruction(Instruction::Store {
+                ptr: lvalue.unwrap(),
+                value: op_after_update.clone(),
+            });
+            (if is_pre { op_after_update } else { op }, None)
+        } else {
+            match &expr.operator.node {
+                UnaryOperator::Address => {
+                    // int a; int* p = &a;
+                    // will return the pointer to the var
+                    // TODO: error handling
+                    let (op, _) = self.translate_expr(&expr.operand.node, true, context)?;
+                    (op.clone(), None)
                 }
-            }
-            Expression::Constant(node) => {
-                let constant = ir::Constant::try_from(&node.node).unwrap();
-                ir::Operand::constant(constant)
-            }
-            /// if it's ++ or --, then do the following transform and return
-            /// the correct operand by it's pre/post semantic
-            /// x = ++i =>
-            ///       %expr
-            ///       %1 = add %expr 1
-            ///       %2 = store %1 i
-            /// should return %1
-            ///
-            /// y = i++ =>
-            ///       %expr
-            ///       %1 = add i 1
-            ///       %2 = store %1 i
-            /// should return %expr
-            ///
-            /// TODO: type cast
-            Expression::UnaryOperator(node) => {
-                if let Some((is_pre, bin_op)) = assign_unary_pre_or_post(&node.node.operator.node) {
-                    // expr
-                    let op = self.translate_expr(&node.node.operand.node, false, context)?;
+                UnaryOperator::Indirection => {
+                    // int a; int* p = &a; *p = 1;
+                    // TODO: fuck this shit
+                    let (op, lvalue) = self.translate_expr(&expr.operand.node, true, context)?;
+                    let value = load_direct(op.clone(), lvalue.is_some(), context);
+                    if no_deref {
+                        (value.clone(), Some(op))
+                    } else {
+                        let orig_value = value;
+                        let value = load_direct(orig_value.clone(), true, context);
+                        (value, Some(orig_value))
+                    }
+                }
+                _ => {
+                    // others are not left value
+                    let (op, _) = self.translate_expr(&expr.operand.node, false, context)?;
                     let dtype = op.dtype();
-                    let ptr = self.get_orig_ptr(&node.node.operand.node).unwrap();
-                    // i1
-                    let const1 = ir::Constant::int(1, dtype.clone());
-                    let inst1 = Instruction::BinOp {
-                        op: bin_op,
-                        lhs: op.clone(),
-                        rhs: ir::Operand::Constant(const1),
-                        dtype: dtype.clone(),
-                    };
-                    // i2
-                    let op1 = context.insert_instruction(inst1).unwrap();
-                    // TODO: do we need type cast here?
-                    // `a++` is not the same as `a+=1`,
-                    // in `a+=1`, 1 is an int
-                    // but in `a++`, we create a const 1 with the same type of a
-                    let store = Instruction::Store {
-                        ptr,
-                        value: op1.clone(),
-                    };
-                    let _ = context.insert_instruction(store);
-                    // finalize operand
-                    if is_pre { op1 } else { op }
-                } else {
-                    let operand = self.translate_expr(&node.node.operand.node, false, context)?;
-                    let dtype = operand.dtype();
                     let inst = Instruction::UnaryOp {
-                        op: node.node.operator.node.clone(),
-                        operand,
+                        op: expr.operator.node.clone(),
+                        operand: op,
                         dtype,
                     };
-                    context.insert_instruction(inst).unwrap()
+                    (context.insert_instruction(inst).unwrap(), None)
                 }
             }
-            /// TODO: type cast
-            /// TODO: logical expression evaluation
-            ///
-            /// if is assign (can be = or ++), then lhs must be a pointer, rhs must be a value
-            /// if not, then lhs and rhs are both values
-            Expression::BinaryOperator(node) => {
-                // both lhs and rhs might be a local allocation
-                // use the `maybe_load_local` instead of `translate_expr` result
+        };
+        Ok((op, ptr))
+    }
 
-                /// if node's operator is +=, -=, *=, then transform into the corresponding
-                /// more and insert the following extra instructions:
-                /// lhs += rhs:
-                ///      %1 = add lhs rhs
-                ///      %2 = store %1
-                ///
-                /// should return %2
-                if let Some(assign_op) = assign_binop(&node.node.operator.node) {
-                    let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
-                    let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
-                    let lhs_ptr = self.get_orig_ptr(&node.node.lhs.node).unwrap();
-                    let dtype_ptr = lhs_ptr.dtype();
-                    let dtype = dtype_ptr.get_pointer_inner().cloned().unwrap();
-                    // assign cast1: assignment operator
-                    let rhs = cast(rhs, &dtype, context);
-                    // %1
-                    let compute = Instruction::BinOp {
-                        op: assign_op,
-                        lhs,
-                        rhs,
-                        dtype,
-                    };
-                    // %2
-                    let op2 = context.insert_instruction(compute).unwrap();
-                    let store = Instruction::Store {
-                        ptr: lhs_ptr,
-                        value: op2.clone(),
-                    };
-                    let _ = context.insert_instruction(store);
-                    op2
-                } else if matches!(&node.node.operator.node, BinaryOperator::Assign) {
-                    let lhs = self.translate_expr(&node.node.lhs.node, true, context)?;
-                    let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
+    fn translate_binary_expr(
+        &mut self,
+        orig_expr: &Expression, // TODO: consider remove this
+        expr: &BinaryOperatorExpression,
+        no_deref: bool,
+        context: &mut Context,
+    ) -> Result<(ir::Operand, Option<ir::Operand>), IrgenError> {
+        // both lhs and rhs might be a local allocation
+        // use the `maybe_load_local` instead of `translate_expr` result
+
+        /// if node's operator is +=, -=, *=, then transform into the corresponding
+        /// more and insert the following extra instructions:
+        /// lhs += rhs:
+        ///      %1 = add lhs rhs
+        ///      %2 = store %1
+        ///
+        /// should return %2
+        let mut ptr = None;
+        let op = if let Some(assign_op) = assign_binop(&expr.operator.node) {
+            let (lhs, lvalue) = self.translate_expr(&expr.lhs.node, false, context)?;
+            let (rhs, _) = self.translate_expr(&expr.rhs.node, false, context)?;
+            let lvalue = lvalue.unwrap();
+            let dtype = lhs.dtype();
+            // let dtype = dtype_ptr.get_pointer_inner().cloned().unwrap();
+            // assign cast1: assignment operator
+            let rhs = cast(rhs, &dtype, context);
+            // %1
+            let compute = Instruction::BinOp {
+                op: assign_op,
+                lhs,
+                rhs,
+                dtype,
+            };
+            // %2
+            let op2 = context.insert_instruction(compute).unwrap();
+            let _ = context.insert_instruction(Instruction::Store {
+                ptr: lvalue,
+                value: op2.clone(),
+            });
+            op2
+        } else {
+            match &expr.operator.node {
+                BinaryOperator::Assign => {
+                    // int *p = &a;
+                    // *p = 1;
+                    let (lhs, _) = self.translate_expr(&expr.lhs.node, true, context)?;
+                    let (rhs, _) = self.translate_expr(&expr.rhs.node, false, context)?;
                     let dtype_ptr = lhs.dtype();
                     let dtype = dtype_ptr.get_pointer_inner().cloned().unwrap_or(dtype_ptr);
                     let rhs = cast(rhs, &dtype, context);
-                    let store = Instruction::Store {
+                    let _ = context.insert_instruction(Instruction::Store {
                         ptr: lhs,
                         value: rhs.clone(),
-                    };
-                    let _ = context.insert_instruction(store);
+                    });
                     rhs
-                } else if matches!(&node.node.operator.node, BinaryOperator::Index) {
-                    let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
-                    let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
+                }
+                BinaryOperator::Index => {
+                    let (lhs, _) = self.translate_expr(&expr.lhs.node, false, context)?;
+                    let (rhs, _) = self.translate_expr(&expr.rhs.node, false, context)?;
                     let index_dtype = ir::Dtype::int(64);
                     let rhs = cast(rhs, &index_dtype, context);
 
@@ -1552,40 +1564,99 @@ impl IrgenFunc<'_> {
                         // so we should treat op as an ptr and load it (if it's not an array type)
                         flatten_array(op, &array_type, context, true)
                     }
-                } else if matches!(&node.node.operator.node, BinaryOperator::LogicalAnd)
-                    || matches!(&node.node.operator.node, BinaryOperator::LogicalOr)
-                {
+                }
+                BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => {
                     let mut leaf_nodes = vec![];
                     let mut operators = vec![];
-                    collect_logic_leaf_expr(expr, &mut leaf_nodes, &mut operators);
+                    collect_logic_leaf_expr(orig_expr, &mut leaf_nodes, &mut operators);
                     self.translate_logic_expr(&leaf_nodes, &operators, context)?
-                } else {
-                    let lhs = self.translate_expr(&node.node.lhs.node, false, context)?;
-                    let rhs = self.translate_expr(&node.node.rhs.node, false, context)?;
-                    let operand_dtype = lhs
+                }
+                _ => {
+                    let (lhs, ..) = self.translate_expr(&expr.lhs.node, false, context)?;
+                    let (rhs, _) = self.translate_expr(&expr.rhs.node, false, context)?;
+                    let (operand_dtype, result_dtype) = lhs
                         .dtype()
-                        .binop_dtype(&rhs.dtype(), &node.node.operator.node)
+                        .binop_dtype(&rhs.dtype(), &expr.operator.node)
                         .unwrap();
 
                     let lhs = cast(lhs, &operand_dtype, context);
                     let rhs = cast(rhs, &operand_dtype, context);
-                    let dtype = binop_dtype(&operand_dtype, &node.node.operator.node);
+                    // let dtype = binop_dtype(&operand_dtype, &expr.operator.node);
 
                     let inst = Instruction::BinOp {
-                        op: node.node.operator.node.clone(),
+                        op: expr.operator.node.clone(),
                         lhs,
                         rhs,
-                        dtype,
+                        dtype: result_dtype,
                     };
                     context.insert_instruction(inst).unwrap()
                 }
             }
-            Expression::Statement(node) => todo!(),
-            Expression::StringLiteral(node) => todo!(),
-            Expression::GenericSelection(node) => todo!(),
+        };
+        Ok((op, ptr))
+    }
+
+    /// left value in expr:
+    ///     1. identifier: x   -- expr
+    ///     2. index of array: arr[i]  -- binary
+    ///     3. member: a->member/a.member -- binary
+    ///     4. deref pointer(it could be anything): -> *x  -- unary
+    ///     5. assignment -- unary + binary
+    ///     6. initial value -- todo!()
+    fn translate_expr(
+        &mut self,
+        expr: &Expression,
+        no_deref: bool,
+        context: &mut Context,
+    ) -> Result<(ir::Operand, Option<ir::Operand>), IrgenError> {
+        // TODO: conditional expr
+        let (op, ptr) = match expr {
+            Expression::Identifier(node) => {
+                let op = self.find_symbol(&node.node.name).cloned().expect(&format!(
+                    "{}, symbol table: {:?}",
+                    json!(expr),
+                    self.symbol_table
+                ));
+                // TODO: when shall we load the value from allocation?
+                // if it's the first access of the function argument
+                // store the value from function arg to local allocation slot
+                let should_load = !no_deref && (op.is_global() || op.is_alloc() || op.is_arg());
+                (load_direct(op.clone(), should_load, context), Some(op))
+            }
+            Expression::Constant(node) => (
+                ir::Operand::constant(ir::Constant::try_from(&node.node).unwrap()),
+                None,
+            ),
+            /// if it's ++ or --, then do the following transform and return
+            /// the correct operand by it's pre/post semantic
+            /// x = ++i =>
+            ///       %expr
+            ///       %1 = add %expr 1
+            ///       %2 = store %1 i
+            /// should return %1
+            ///
+            /// y = i++ =>
+            ///       %expr
+            ///       %1 = add i 1
+            ///       %2 = store %1 i
+            /// should return %expr
+            ///
+            /// TODO: type cast
+            Expression::UnaryOperator(node) => {
+                self.translate_unary_expr(&node.node, no_deref, context)?
+            }
+            /// TODO: type cast
+            /// TODO: logical expression evaluation
+            ///
+            /// if is assign (can be = or ++), then lhs must be a pointer, rhs must be a value
+            /// if not, then lhs and rhs are both values
+            Expression::BinaryOperator(node) => {
+                self.translate_binary_expr(expr, &node.node, no_deref, context)?
+            }
             Expression::Member(node) => {
                 // TODO: make it readable
-                let struct_ptr = self.translate_expr(&node.node.expression.node, true, context)?;
+                let (struct_ptr, _) =
+                    self.translate_expr(&node.node.expression.node, true, context)?;
                 let member = node.node.identifier.node.name.clone();
                 let dtype = struct_ptr.dtype();
                 let struct_dtype = dtype.get_pointer_inner().unwrap();
@@ -1604,24 +1675,32 @@ impl IrgenFunc<'_> {
                 };
                 let op = context.insert_instruction(inst).unwrap();
                 // should return ptr rather than the loaded value
-                flatten_array(op, dtype.get_pointer_inner().unwrap(), context, false)
+                (
+                    flatten_array(
+                        op.clone(),
+                        dtype.get_pointer_inner().unwrap(),
+                        context,
+                        false,
+                    ),
+                    Some(op),
+                )
             }
             Expression::Call(node) => {
                 // TODO: if callee is a function pointer
                 // callee can be either
                 // 1. a global variable of function
                 // 2. a function pointer
-                let callee = self.translate_expr(&node.node.callee.node, true, context)?;
+                let (callee, _) = self.translate_expr(&node.node.callee.node, true, context)?;
                 let mut dtype = callee.dtype();
                 if let Some(inner) = dtype.get_pointer_inner() {
                     dtype = inner.clone()
                 };
 
-                if let ir::Dtype::Function { ret, params } = &dtype {
+                let op = if let ir::Dtype::Function { ret, params } = &dtype {
                     let mut args = vec![];
                     assert_eq!(params.len(), node.node.arguments.len());
                     for (expr, target_dtype) in node.node.arguments.iter().zip(params) {
-                        let op = self.translate_expr(&expr.node, false, context)?;
+                        let (op, _) = self.translate_expr(&expr.node, false, context)?;
                         // assign cast3: function call
                         let op = cast(op, target_dtype, context);
                         args.push(op);
@@ -1635,9 +1714,9 @@ impl IrgenFunc<'_> {
                     context.insert_instruction(inst).unwrap()
                 } else {
                     unreachable!("{callee:?}")
-                }
+                };
+                (op, None)
             }
-            Expression::CompoundLiteral(node) => todo!(),
             Expression::SizeOfTy(node) => {
                 let tname = node
                     .node
@@ -1654,18 +1733,24 @@ impl IrgenFunc<'_> {
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(tname.len(), 1);
-                ir::Operand::constant(ir::Constant::int(
-                    tname[0] as _,
-                    ir::Dtype::int(64).signed(false),
-                ))
+                (
+                    ir::Operand::constant(ir::Constant::int(
+                        tname[0] as _,
+                        ir::Dtype::int(64).signed(false),
+                    )),
+                    None,
+                )
             }
             Expression::SizeOfVal(node) => {
                 let dtype = self.type_of_expr(&node.node.0.node).unwrap();
                 let (size, _) = dtype.size_align_of(&self.structs).unwrap();
-                ir::Operand::constant(ir::Constant::int(
-                    size as _,
-                    ir::Dtype::int(64).signed(false),
-                ))
+                (
+                    ir::Operand::constant(ir::Constant::int(
+                        size as _,
+                        ir::Dtype::int(64).signed(false),
+                    )),
+                    None,
+                )
             }
             Expression::AlignOf(node) => {
                 let tname = node
@@ -1684,14 +1769,18 @@ impl IrgenFunc<'_> {
                     .collect::<Vec<_>>();
                 assert_eq!(tname.len(), 1);
                 let dtype = ir::Dtype::int(64).signed(false);
-                ir::Operand::constant(ir::Constant::int(tname[0] as _, dtype))
+                (
+                    ir::Operand::constant(ir::Constant::int(tname[0] as _, dtype)),
+                    None,
+                )
             }
             Expression::Cast(node) => {
-                let op = self.translate_expr(&node.node.expression.node, false, context)?;
+                let (op, _) = self.translate_expr(&node.node.expression.node, false, context)?;
                 // TODO: resolve struct and typedef types
                 let dtype = ir::Dtype::try_from(&node.node.type_name.node).unwrap();
-                let cast = cast(op, &dtype, context);
-                cast
+                let op = cast(op, &dtype, context);
+                // ptr = Some(op.clone());
+                (op, None)
             }
             /// b_before:
             ///     before
@@ -1705,7 +1794,7 @@ impl IrgenFunc<'_> {
             /// b_after:
             ///     after
             Expression::Conditional(node) => {
-                let op = self.translate_expr(&node.node.condition.node, false, context)?;
+                let (op, _) = self.translate_expr(&node.node.condition.node, false, context)?;
                 let op = op_to_cond(&node.node.condition.node, op, context);
 
                 let mut ctx_then = Context::new(self.alloc_bid());
@@ -1731,7 +1820,7 @@ impl IrgenFunc<'_> {
                 );
 
                 // 1.1 then expr
-                let op =
+                let (op, _) =
                     self.translate_expr(&node.node.then_expression.node, false, &mut ctx_then)?;
                 let dtype = op.dtype();
 
@@ -1760,7 +1849,7 @@ impl IrgenFunc<'_> {
                 );
 
                 // 2. else expr
-                let op =
+                let (op, _) =
                     self.translate_expr(&node.node.else_expression.node, false, &mut ctx_else)?;
                 // TODO: doe we need to cast type here?
                 let store1 = Instruction::Store {
@@ -1777,21 +1866,24 @@ impl IrgenFunc<'_> {
 
                 // 3. now the active context is ctx_after
                 //    return the load of the temp value as the return result of the whole conditional expr
-                let load = Instruction::Load { ptr: ptr.clone() };
-                context.insert_instruction(load).unwrap()
+                (load_direct(ptr.clone(), !no_deref, context), Some(ptr))
             }
             Expression::Comma(vec) => {
                 let mut op = None;
                 for expr in vec.iter() {
-                    op = Some(self.translate_expr(&expr.node, false, context)?);
+                    op = Some(self.translate_expr(&expr.node, false, context)?.0);
                 }
-                op.unwrap()
+                (op.unwrap(), None)
             }
-            Expression::OffsetOf(node) => todo!(),
-            Expression::VaArg(node) => todo!(),
+            Expression::CompoundLiteral(..) => todo!(),
+            Expression::Statement(..) => todo!(),
+            Expression::StringLiteral(..) => todo!(),
+            Expression::GenericSelection(..) => todo!(),
+            Expression::OffsetOf(..) => todo!(),
+            Expression::VaArg(..) => todo!(),
         };
 
-        Ok(op)
+        Ok((op, ptr))
     }
 
     /// Translate initial parameter declarations of the functions to IR.
@@ -1895,6 +1987,11 @@ impl IrgenFunc<'_> {
 
         Ok(())
     }
+}
+
+struct ExprResult {
+    result: ir::Operand,
+    ptr: Option<ir::Operand>,
 }
 
 #[inline]
@@ -2030,7 +2127,7 @@ fn assign_binop(op: &BinaryOperator) -> Option<BinaryOperator> {
 }
 
 // returns: (if its's a self assign pre operator, the corresponding bin op)
-fn assign_unary_pre_or_post(op: &UnaryOperator) -> Option<(bool, BinaryOperator)> {
+fn is_unary_assign(op: &UnaryOperator) -> Option<(bool, BinaryOperator)> {
     match op {
         UnaryOperator::PreIncrement => Some((true, BinaryOperator::Plus)),
         UnaryOperator::PreDecrement => Some((true, BinaryOperator::Minus)),
@@ -2045,6 +2142,15 @@ fn identifier(expr: &Expression) -> Option<String> {
         Some(id.node.name.clone())
     } else {
         None
+    }
+}
+
+fn load_direct(ptr: ir::Operand, should_load: bool, context: &mut Context) -> ir::Operand {
+    if should_load {
+        let load = Instruction::Load { ptr };
+        context.insert_instruction(load).unwrap()
+    } else {
+        ptr
     }
 }
 
@@ -2127,9 +2233,9 @@ fn binop_dtype(operand_dtype: &ir::Dtype, operator: &BinaryOperator) -> ir::Dtyp
         | BinaryOperator::AssignBitwiseXor
         | BinaryOperator::AssignBitwiseOr => operand_dtype.clone(),
 
-        BinaryOperator::BitwiseAnd
-        | BinaryOperator::BitwiseXor
-        | BinaryOperator::BitwiseOr => ir::Dtype::int(32),
+        BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseXor | BinaryOperator::BitwiseOr => {
+            ir::Dtype::int(32)
+        }
 
         BinaryOperator::Assign => ir::Dtype::unit(),
 
@@ -2148,7 +2254,7 @@ fn flatten_array(
 ) -> ir::Operand {
     if let ir::Dtype::Array { inner, .. } = array_type {
         // TODO: why is here i32 rather than i64 in `GetElementPtr` inst in other places?
-        let c = ir::Constant::int(0, ir::Dtype::int(32));
+        let c = ir::Constant::int(0, ir::Dtype::INT);
         let inner_dtype = ir::Dtype::pointer(*inner.clone());
         let inst = Instruction::GetElementPtr {
             ptr: op,
@@ -2156,11 +2262,8 @@ fn flatten_array(
             dtype: inner_dtype,
         };
         context.insert_instruction(inst).unwrap()
-    } else if should_load {
-        let inst = Instruction::Load { ptr: op };
-        context.insert_instruction(inst).unwrap()
     } else {
-        op
+        load_direct(op, should_load, context)
     }
 }
 
