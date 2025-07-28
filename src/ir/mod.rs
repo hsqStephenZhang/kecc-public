@@ -848,6 +848,8 @@ impl Constant {
 
     pub const ZERO_U1: Self = Self::Int { value: 0, width: 1, is_signed: false };
     pub const ONE_U1: Self = Self::Int { value: 1, width: 1, is_signed: false };
+    pub const ZERO_INT: Self = Self::Int { value: 0, width: 32, is_signed: true };
+    pub const ONE_I64: Self = Self::Int { value: 1, width: 64, is_signed: true };
 
     #[inline]
     pub fn is_integer_constant(&self) -> bool {

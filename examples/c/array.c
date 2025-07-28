@@ -15,5 +15,5 @@ int main() {
         a[i] = i;
     }
 
-    return sum(len, a) == 10;
+    return sum(len, a) == 11;
 }

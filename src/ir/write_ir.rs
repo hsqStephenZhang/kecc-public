@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn test_writeir() -> io::Result<()> {
         let mut stdout = stdout();
-        let file = "fib2";
+        let file = "array4";
         let c_path = format!("{C_DIR}{file}.c");
         let ir_path = format!("{IR_DIR}{file}.ir");
         let c_file = Path::new(&c_path);

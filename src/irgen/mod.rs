@@ -486,8 +486,11 @@ impl Context {
 }
 
 trait OpExt {
-    fn with_load(self, should_load: bool, context: &mut Context) -> ir::Operand;
-    fn with_cast(self, target_dtype: &ir::Dtype, context: &mut Context) -> ir::Operand;
+    type Ctx;
+    type T;
+
+    fn with_load(self, should_load: bool, context: &mut Self::Ctx) -> Self;
+    fn with_cast(self, target: &Self::T, context: &mut Self::Ctx) -> Self;
 }
 
 /// A C function being translated.
@@ -1420,22 +1423,56 @@ impl IrgenFunc<'_> {
         let (op, ptr) = if let Some((is_pre, bin_op)) = is_unary_assign(&expr.operator.node) {
             // a++, a--, ++a, --a
             // we need lvalue here
-            // TODO: can we handle pointer++
             let (op, lvalue) = self.translate_expr(&expr.operand.node, false, context)?;
             let dtype = op.dtype();
-            let op_after_update = context
-                .insert_instruction(Instruction::BinOp {
-                    op: bin_op,
-                    lhs: op.clone(),
-                    rhs: ir::Operand::Constant(ir::Constant::int(1, dtype.clone())),
-                    dtype: dtype.clone(),
-                })
-                .unwrap();
-            let _ = context.insert_instruction(Instruction::Store {
-                ptr: lvalue.unwrap(),
-                value: op_after_update.clone(),
-            });
-            (if is_pre { op_after_update } else { op }, None)
+            if let Some(inner_dtype) = dtype.get_pointer_inner() {
+                // int *p = ...; p++ ; will be translated into:
+                // %b3:i0:i32* = load %l1:i32**
+                // %b3:i1:i64 = mul 1:i64 4:i64
+                // %b3:i2:i32* = getelementptr %b3:i0:i32* offset %b3:i1:i64
+                // %b3:i3:unit = store %b3:i2:i32* %l1:i32**
+                // return %b3:i0:i32*
+                let (size, _) = inner_dtype.size_align_of(&self.structs).unwrap();
+
+                let offset = context
+                    .insert_instruction(Instruction::BinOp {
+                        op: BinaryOperator::Multiply,
+                        lhs: ir::Operand::constant(ir::Constant::ONE_I64),
+                        rhs: ir::Operand::constant(ir::Constant::int(
+                            size as _,
+                            ir::Dtype::IPOINTER,
+                        )),
+                        dtype: ir::Dtype::IPOINTER,
+                    })
+                    .unwrap();
+                let op_after_update = context
+                    .insert_instruction(Instruction::GetElementPtr {
+                        ptr: op.clone(),
+                        offset,
+                        dtype,
+                    })
+                    .unwrap();
+                let _ = context.insert_instruction(Instruction::Store {
+                    ptr: lvalue.unwrap(),
+                    value: op_after_update.clone(),
+                });
+
+                (op, None)
+            } else {
+                let op_after_update = context
+                    .insert_instruction(Instruction::BinOp {
+                        op: bin_op,
+                        lhs: op.clone(),
+                        rhs: ir::Operand::Constant(ir::Constant::int(1, dtype.clone())),
+                        dtype: dtype.clone(),
+                    })
+                    .unwrap();
+                let _ = context.insert_instruction(Instruction::Store {
+                    ptr: lvalue.unwrap(),
+                    value: op_after_update.clone(),
+                });
+                (if is_pre { op_after_update } else { op }, None)
+            }
         } else {
             match &expr.operator.node {
                 UnaryOperator::Address => {
@@ -1491,7 +1528,6 @@ impl IrgenFunc<'_> {
         ///      %2 = store %1
         ///
         /// should return %2
-        let mut ptr = None;
         let op = if let Some(assign_op) = assign_binop(&expr.operator.node) {
             let (lhs, lvalue) = self.translate_expr(&expr.lhs.node, false, context)?;
             let (rhs, _) = self.translate_expr(&expr.rhs.node, false, context)?;
@@ -1531,12 +1567,12 @@ impl IrgenFunc<'_> {
                     rhs
                 }
                 BinaryOperator::Index => {
-                    let (lhs, _) = self.translate_expr(&expr.lhs.node, false, context)?;
+                    let (lhs, lvalue) = self.translate_expr(&expr.lhs.node, false, context)?;
+
                     let (rhs, _) = self.translate_expr(&expr.rhs.node, false, context)?;
                     let index_dtype = ir::Dtype::int(64);
                     let rhs = cast(rhs, &index_dtype, context);
 
-                    // dtype is a pointer to array
                     let dtype = lhs.dtype();
 
                     let (size, _) = dtype.index_dtype().size_align_of(self.structs).unwrap();
@@ -1556,13 +1592,13 @@ impl IrgenFunc<'_> {
                     };
 
                     let op = context.insert_instruction(inst).unwrap();
-                    let array_type = op.dtype().get_pointer_inner().cloned().unwrap();
+                    let array_type = op.dtype().get_point_or_array_inner().cloned().unwrap();
                     if no_deref {
                         op
                     } else {
                         // we are evaluating index expr, and no_deref is false,
                         // so we should treat op as an ptr and load it (if it's not an array type)
-                        flatten_array(op, &array_type, context, true)
+                        load_direct(op, true, context)
                     }
                 }
                 BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => {
@@ -1593,16 +1629,15 @@ impl IrgenFunc<'_> {
                 }
             }
         };
-        Ok((op, ptr))
+        Ok((op, None))
     }
 
-    /// left value in expr:
-    ///     1. identifier: x   -- expr
-    ///     2. index of array: arr[i]  -- binary
-    ///     3. member: a->member/a.member -- binary
-    ///     4. deref pointer(it could be anything): -> *x  -- unary
-    ///     5. assignment -- unary + binary
-    ///     6. initial value -- todo!()
+    /// return value is lvalue in the following cases:
+    ///     1. identifier: x   -- Expression::Identifier
+    ///     2. index of array: arr[i]  -- Expression::Unary && Index
+    ///     3. member: a->member/a.member -- Expression::Member
+    ///     4. deref pointer(it could be anything): -> *x  -- Expression::Unary && Indirection
+    ///     5. literals
     fn translate_expr(
         &mut self,
         expr: &Expression,
@@ -1674,7 +1709,6 @@ impl IrgenFunc<'_> {
                     dtype: dtype.clone(),
                 };
                 let op = context.insert_instruction(inst).unwrap();
-                // should return ptr rather than the loaded value
                 (
                     flatten_array(
                         op.clone(),
@@ -2147,8 +2181,18 @@ fn identifier(expr: &Expression) -> Option<String> {
 
 fn load_direct(ptr: ir::Operand, should_load: bool, context: &mut Context) -> ir::Operand {
     if should_load {
-        let load = Instruction::Load { ptr };
-        context.insert_instruction(load).unwrap()
+        let inner = ptr.dtype().get_pointer_inner().cloned().unwrap();
+        if let Some(d) = inner.get_array_inner() {
+            let element = Instruction::GetElementPtr {
+                ptr,
+                offset: ir::Operand::constant(ir::Constant::ZERO_INT),
+                dtype: ir::Dtype::pointer(d.clone()),
+            };
+            context.insert_instruction(element).unwrap()
+        } else {
+            let load = Instruction::Load { ptr };
+            context.insert_instruction(load).unwrap()
+        }
     } else {
         ptr
     }

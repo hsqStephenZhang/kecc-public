@@ -568,6 +568,8 @@ impl Dtype {
     };
 
     /// TODO(document)
+    pub const IPOINTER: Self = Self::int(Self::SIZE_OF_POINTER * Self::BITS_OF_BYTE);
+    
     pub const LONG: Self = Self::int(Self::SIZE_OF_LONG * Self::BITS_OF_BYTE);
 
     /// TODO(document)
@@ -771,6 +773,17 @@ impl Dtype {
     }
 
     #[inline]
+    pub fn get_point_or_array_inner(&self) -> Option<&Self> {
+        if let Self::Array { inner, .. } = self {
+            Some(inner.deref())
+        } else if let Self::Pointer { inner, .. } = self {
+            Some(inner.deref())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     pub fn get_struct_name(&self) -> Option<&Option<String>> {
         if let Self::Struct { name, .. } = self {
             Some(name)
@@ -829,6 +842,15 @@ impl Dtype {
     #[inline]
     pub fn is_int(&self, width: Option<usize>) -> bool {
         if let Self::Int { width: w, .. } = self {
+            width.is_none() || width == Some(*w)
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub fn is_float(&self, width: Option<usize>) -> bool {
+        if let Self::Float { width: w, .. } = self {
             width.is_none() || width == Some(*w)
         } else {
             false
@@ -1432,8 +1454,59 @@ impl Dtype {
             | ast::BinaryOperator::Modulo
             | ast::BinaryOperator::Plus
             | ast::BinaryOperator::Minus => {
-                todo!("arithmatic conversion by priority")
-            },
+                if self.is_float(None) & r_type.is_float(None) {
+                    let s1 = self.get_float_width().unwrap();
+                    let s2 = r_type.get_float_width().unwrap();
+                    let t = if s1 > s2 {
+                        self.clone()
+                    } else if s1 < s2 {
+                        r_type.clone()
+                    } else {
+                        let Self::Float {
+                            is_const: c1,
+                            width,
+                        } = self
+                        else {
+                            unreachable!()
+                        };
+                        let Self::Float { is_const: c2, .. } = r_type else {
+                            unreachable!()
+                        };
+                        Self::Float {
+                            width: *width,
+                            is_const: *c1 && *c2,
+                        }
+                    };
+                    Some((t.clone(), t))
+                } else if self.is_float(None) | r_type.is_float(None) {
+                    let t = if self.is_float(None) {
+                        self.clone()
+                    } else {
+                        r_type.clone()
+                    };
+                    let Self::Float { is_const, width } = t else {
+                        unreachable!()
+                    };
+                    let t = Self::Float {
+                        width,
+                        is_const: self.is_const() && r_type.is_const(),
+                    };
+                    Some((t.clone(), t))
+                } else {
+                    let (left, l_signed) = self.clone().int_promotion();
+                    let (right, r_signed) = r_type.clone().int_promotion();
+                    let s1 = left.get_int_width().unwrap();
+                    let s2 = right.get_int_width().unwrap();
+                    let t = if s1 > s2 {
+                        left
+                    } else if s1 < s2 {
+                        right
+                    } else {
+                        left.signed(l_signed && r_signed)
+                    };
+                    Some((t.clone(), t))
+                }
+            }
             ast::BinaryOperator::Assign
             | ast::BinaryOperator::AssignMultiply
             | ast::BinaryOperator::AssignDivide
@@ -1455,14 +1528,36 @@ impl Dtype {
             | ast::BinaryOperator::Equals
             | ast::BinaryOperator::NotEquals => {
                 // logical
-                return Some((Self::INT, Self::BOOL))
+                return Some((Self::INT, Self::BOOL));
             }
 
             ast::BinaryOperator::Index => todo!(),
             ast::BinaryOperator::LogicalAnd => todo!(),
             ast::BinaryOperator::LogicalOr => todo!(),
         }
-        
+    }
+
+    pub fn int_promotion(self) -> (Self, bool) {
+        let Self::Int {
+            width,
+            is_signed,
+            is_const,
+        } = self
+        else {
+            unreachable!()
+        };
+        if width < 32 {
+            (
+                Self::Int {
+                    width: 32,
+                    is_signed: true,
+                    is_const,
+                },
+                true,
+            )
+        } else {
+            (self, is_signed)
+        }
     }
 }
 
