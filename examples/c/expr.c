@@ -19,5 +19,13 @@ int main() {
   int e = (a = 0) || (b = 5);
   int d_is_5 = *d == 5; // *d should be 5 now
 
-  return d_is_5;
+  float dd = 5;
+  int dd_is_5 = dd == 5;
+
+  int arr[4][5];
+  *&arr[2][3] = 6;
+
+  int arr23_is_6 = arr[2][3] == 6;
+
+  return c && d_is_5 && dd_is_5 && arr23_is_6;
 }

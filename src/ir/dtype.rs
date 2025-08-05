@@ -3,6 +3,7 @@ use core::fmt;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
+use itertools::Either;
 use lang_c::ast;
 use lang_c::span::Node;
 use thiserror::Error;
@@ -569,7 +570,7 @@ impl Dtype {
 
     /// TODO(document)
     pub const IPOINTER: Self = Self::int(Self::SIZE_OF_POINTER * Self::BITS_OF_BYTE);
-    
+
     pub const LONG: Self = Self::int(Self::SIZE_OF_LONG * Self::BITS_OF_BYTE);
 
     /// TODO(document)
@@ -802,6 +803,32 @@ impl Dtype {
     }
 
     #[inline]
+    pub fn get_struct_fields2(
+        &self,
+        structs: &HashMap<String, Option<Dtype>>,
+    ) -> Option<Vec<Named<Dtype>>> {
+        if let Self::Struct { name, fields, .. } = self {
+            match fields {
+                Some(fields) => Some(fields.clone()),
+                None => {
+                    let name = name.clone().unwrap();
+                    let d = structs.get(&name).cloned().unwrap();
+                    d.map(|d| {
+                        if let Self::Struct { fields, .. } = d {
+                            fields
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     pub fn get_struct_size_align_offsets(&self) -> Option<&Option<(usize, usize, Vec<usize>)>> {
         if let Self::Struct {
             size_align_offsets, ..
@@ -1024,7 +1051,7 @@ impl Dtype {
                 .expect("`offsets` must be `Some`");
 
             assert_eq!(fields.len(), offsets.len());
-            for (field, &offset) in fields.iter().zip(offsets) {
+            for (idx, (field, &offset)) in fields.iter().zip(offsets).enumerate() {
                 if let Some(name) = field.name() {
                     if name == field_name {
                         return Some((offset, field.deref().clone()));
@@ -1037,6 +1064,53 @@ impl Dtype {
                         continue;
                     };
                     return Some((offset + offset_inner, dtype));
+                }
+            }
+
+            None
+        } else {
+            None
+        }
+    }
+
+    pub fn get_offset_struct_field_flat(
+        &self,
+        field_name_or_index: Either<&str, usize>,
+        structs: &HashMap<String, Option<Dtype>>,
+    ) -> Option<(usize, Self)> {
+        if let Self::Struct { name, .. } = self {
+            let struct_name = name.as_ref().expect("`self` must have its name");
+            let struct_type = structs
+                .get(struct_name)
+                .expect("`structs` must have value matched with `struct_name`")
+                .as_ref()
+                .expect("`struct_type` must have its definition");
+            let fields = struct_type
+                .get_struct_fields()
+                .expect("`struct_type` must be struct type")
+                .as_ref()
+                .expect("`fields` must be `Some`");
+            let (_, _, offsets) = struct_type
+                .get_struct_size_align_offsets()
+                .expect("`struct_type` must be struct type")
+                .as_ref()
+                .expect("`offsets` must be `Some`");
+
+            assert_eq!(fields.len(), offsets.len());
+            for (idx, (field, &offset)) in fields.iter().zip(offsets).enumerate() {
+                if match field_name_or_index {
+                    Either::Left(s) => {
+                        if let Some(name) = field.name()
+                            && name == s
+                        {
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Either::Right(i) => idx == i,
+                } {
+                    return Some((offset, field.deref().clone()));
                 }
             }
 
@@ -1454,58 +1528,8 @@ impl Dtype {
             | ast::BinaryOperator::Modulo
             | ast::BinaryOperator::Plus
             | ast::BinaryOperator::Minus => {
-                if self.is_float(None) & r_type.is_float(None) {
-                    let s1 = self.get_float_width().unwrap();
-                    let s2 = r_type.get_float_width().unwrap();
-                    let t = if s1 > s2 {
-                        self.clone()
-                    } else if s1 < s2 {
-                        r_type.clone()
-                    } else {
-                        let Self::Float {
-                            is_const: c1,
-                            width,
-                        } = self
-                        else {
-                            unreachable!()
-                        };
-                        let Self::Float { is_const: c2, .. } = r_type else {
-                            unreachable!()
-                        };
-                        Self::Float {
-                            width: *width,
-                            is_const: *c1 && *c2,
-                        }
-                    };
-                    Some((t.clone(), t))
-                } else if self.is_float(None) | r_type.is_float(None) {
-                    let t = if self.is_float(None) {
-                        self.clone()
-                    } else {
-                        r_type.clone()
-                    };
-                    let Self::Float { is_const, width } = t else {
-                        unreachable!()
-                    };
-                    let t = Self::Float {
-                        width,
-                        is_const: self.is_const() && r_type.is_const(),
-                    };
-                    Some((t.clone(), t))
-                } else {
-                    let (left, l_signed) = self.clone().int_promotion();
-                    let (right, r_signed) = r_type.clone().int_promotion();
-                    let s1 = left.get_int_width().unwrap();
-                    let s2 = right.get_int_width().unwrap();
-                    let t = if s1 > s2 {
-                        left
-                    } else if s1 < s2 {
-                        right
-                    } else {
-                        left.signed(l_signed && r_signed)
-                    };
-                    Some((t.clone(), t))
-                }
+                let operand_dtype = self.arithmatic(r_type);
+                Some((operand_dtype.clone(), operand_dtype))
             }
             ast::BinaryOperator::Assign
             | ast::BinaryOperator::AssignMultiply
@@ -1528,7 +1552,8 @@ impl Dtype {
             | ast::BinaryOperator::Equals
             | ast::BinaryOperator::NotEquals => {
                 // logical
-                return Some((Self::INT, Self::BOOL));
+                let operand_dtype = self.arithmatic(r_type);
+                return Some((operand_dtype, Self::BOOL));
             }
 
             ast::BinaryOperator::Index => todo!(),
@@ -1557,6 +1582,59 @@ impl Dtype {
             )
         } else {
             (self, is_signed)
+        }
+    }
+
+    fn arithmatic(&self, r_type: &Self) -> Self {
+        if self.is_float(None) & r_type.is_float(None) {
+            let s1 = self.get_float_width().unwrap();
+            let s2 = r_type.get_float_width().unwrap();
+            let t = if s1 > s2 {
+                self.clone()
+            } else if s1 < s2 {
+                r_type.clone()
+            } else {
+                let Self::Float {
+                    is_const: c1,
+                    width,
+                } = self
+                else {
+                    unreachable!()
+                };
+                let Self::Float { is_const: c2, .. } = r_type else {
+                    unreachable!()
+                };
+                Self::Float {
+                    width: *width,
+                    is_const: *c1 && *c2,
+                }
+            };
+            t
+        } else if self.is_float(None) | r_type.is_float(None) {
+            let t = if self.is_float(None) {
+                self.clone()
+            } else {
+                r_type.clone()
+            };
+            let Self::Float { is_const, width } = t else {
+                unreachable!()
+            };
+            Self::Float {
+                width,
+                is_const: self.is_const() && r_type.is_const(),
+            }
+        } else {
+            let (left, l_signed) = self.clone().int_promotion();
+            let (right, r_signed) = r_type.clone().int_promotion();
+            let s1 = left.get_int_width().unwrap();
+            let s2 = right.get_int_width().unwrap();
+            if s1 > s2 {
+                left
+            } else if s1 < s2 {
+                right
+            } else {
+                left.signed(l_signed && r_signed)
+            }
         }
     }
 }

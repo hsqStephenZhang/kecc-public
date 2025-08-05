@@ -650,22 +650,22 @@ impl IrgenFunc<'_> {
             Expression::Identifier(node) => self
                 .find_symbol(&node.node.name)
                 .cloned()
-                .map(|op| op.dtype()),
+                .map(|op| op.dtype().get_pointer_inner().cloned().unwrap()),
             Expression::Constant(node) => {
                 ir::Constant::try_from(&node.node).ok().map(|c| c.dtype())
             }
             Expression::UnaryOperator(node) => {
                 let op = self.type_of_expr(&node.node.operand.node);
-                op.map(|op| match &node.node.operator.node {
-                    UnaryOperator::Address => Some(ir::Dtype::pointer(op)),
+                op.map(|dtype| match &node.node.operator.node {
+                    UnaryOperator::Address => Some(ir::Dtype::pointer(dtype)),
                     UnaryOperator::Indirection => {
-                        if let Some(ptr) = op.get_pointer_inner() {
+                        if let Some(ptr) = dtype.get_pointer_inner() {
                             Some(ptr.clone())
                         } else {
                             None
                         }
                     }
-                    _ => Some(op),
+                    _ => Some(dtype),
                 })
                 .unwrap_or_default()
             }
@@ -804,13 +804,22 @@ impl IrgenFunc<'_> {
 
             // TODO: is it correct
             if let Some(initializer) = init_decl.node.initializer.as_ref() {
-                self.translate_initializor(&dtype, &ptr, &initializer.node, context)?;
+                self.translate_initializer(&dtype, &ptr, &initializer.node, context)?;
             }
         }
         Ok(())
     }
 
-    fn translate_initializor(
+    fn translate_designator(
+        &mut self,
+        ptr: &ir::Operand,
+        initializer: &Initializer,
+        context: &mut Context,
+    ) -> Result<(), IrgenError> {
+        todo!()
+    }
+
+    fn translate_initializer(
         &mut self,
         dtype: &ir::Dtype,
         ptr: &ir::Operand,
@@ -819,21 +828,88 @@ impl IrgenFunc<'_> {
     ) -> Result<(), IrgenError> {
         match &initializer {
             Initializer::Expression(node) => {
-                let (op, _) = self.translate_expr(&node.node, false, context)?;
+                let value = self.translate_expr(&node.node, false, context)?.0;
                 // assign cast2: initialization
-                let op = cast(op, &dtype, context);
+                let value = cast(value, &dtype, context);
                 let inst = Instruction::Store {
                     ptr: ptr.clone(),
-                    value: op.clone(),
+                    value,
                 };
                 let _ = context.insert_instruction(inst).unwrap();
             }
             Initializer::List(nodes) => {
-                for item in nodes {
-                    let dtype = todo!();
-                    let ptr = todo!();
-                    self.translate_initializor(dtype, ptr, initializer, context)?;
-                    // let value = self.translate_expr(&item.node., not_deref, context)
+                let has_used_name = false;
+                let mut current_offset = 0;
+                if dtype.is_array() {
+                    let element_dtype = dtype.get_array_inner().cloned().unwrap();
+                    let inst = Instruction::GetElementPtr {
+                        ptr: ptr.clone(),
+                        offset: ir::Operand::constant(ir::Constant::ZERO_INT),
+                        dtype: ir::Dtype::pointer(element_dtype.clone()),
+                    };
+                    let actual_ptr = context.insert_instruction(inst).unwrap();
+
+                    let mut offset = 0;
+                    for item in nodes.iter() {
+                        let offset_op =
+                            ir::Operand::constant(ir::Constant::int(offset, ir::Dtype::int(64)));
+
+                        let inst = Instruction::GetElementPtr {
+                            ptr: actual_ptr.clone(),
+                            offset: offset_op,
+                            dtype: ir::Dtype::pointer(dtype.clone()),
+                        };
+                        let field_ptr = context.insert_instruction(inst).unwrap();
+                        self.translate_initializer(
+                            &element_dtype,
+                            &field_ptr,
+                            &item.node.initializer.node,
+                            context,
+                        )?;
+                        offset += element_dtype.size_align_of(self.structs).unwrap().0 as u128;
+                    }
+                } else {
+                    let fields = dtype.get_struct_fields2(self.structs).unwrap();
+                    dbg!(&fields);
+                    let mut idx = 0;
+                    for item in nodes.iter() {
+                        let offset_and_dtype = if item.node.designation.is_empty() {
+                            let mut name = None;
+                            let name_or_index = match fields[idx].name().cloned() {
+                                Some(s) => {
+                                    name = Some(s);
+                                    Either::Left(name.as_ref().map(|s| s.as_str()).unwrap())
+                                }
+                                None => Either::Right(idx),
+                            };
+                            dtype.get_offset_struct_field_flat(name_or_index, self.structs)
+                        } else {
+                            if let Designator::Member(member) = &item.node.designation[0].node {
+                                let name = member.node.name.as_str();
+                                dtype.get_offset_struct_field_flat(Either::Left(name), self.structs)
+                            } else {
+                                unreachable!()
+                            }
+                        };
+                        let (offset, dtype) = offset_and_dtype.unwrap();
+                        let offset = ir::Operand::constant(ir::Constant::int(
+                            offset as _,
+                            ir::Dtype::int(64),
+                        ));
+                        let inst = Instruction::GetElementPtr {
+                            ptr: ptr.clone(),
+                            offset,
+                            dtype: ir::Dtype::pointer(dtype.clone()),
+                        };
+                        let field_ptr = context.insert_instruction(inst).unwrap();
+                        self.translate_initializer(
+                            &dtype,
+                            &field_ptr,
+                            &item.node.initializer.node,
+                            context,
+                        )?;
+                        idx += 1;
+                    }
                 }
             }
         }
@@ -1485,10 +1561,11 @@ impl IrgenFunc<'_> {
                 UnaryOperator::Indirection => {
                     // int a; int* p = &a; *p = 1;
                     // TODO: fuck this shit
-                    let (op, lvalue) = self.translate_expr(&expr.operand.node, true, context)?;
-                    let value = load_direct(op.clone(), lvalue.is_some(), context);
+                    let (value, lvalue) =
+                        self.translate_expr(&expr.operand.node, false, context)?;
+                    // let value = load_direct(op.clone(), lvalue.is_some(), context);
                     if no_deref {
-                        (value.clone(), Some(op))
+                        (value, lvalue)
                     } else {
                         let orig_value = value;
                         let value = load_direct(orig_value.clone(), true, context);
@@ -1652,9 +1729,6 @@ impl IrgenFunc<'_> {
                     json!(expr),
                     self.symbol_table
                 ));
-                // TODO: when shall we load the value from allocation?
-                // if it's the first access of the function argument
-                // store the value from function arg to local allocation slot
                 let should_load = !no_deref && (op.is_global() || op.is_alloc() || op.is_arg());
                 (load_direct(op.clone(), should_load, context), Some(op))
             }
@@ -1676,13 +1750,9 @@ impl IrgenFunc<'_> {
             ///       %2 = store %1 i
             /// should return %expr
             ///
-            /// TODO: type cast
             Expression::UnaryOperator(node) => {
                 self.translate_unary_expr(&node.node, no_deref, context)?
             }
-            /// TODO: type cast
-            /// TODO: logical expression evaluation
-            ///
             /// if is assign (can be = or ++), then lhs must be a pointer, rhs must be a value
             /// if not, then lhs and rhs are both values
             Expression::BinaryOperator(node) => {
@@ -1714,7 +1784,7 @@ impl IrgenFunc<'_> {
                         op.clone(),
                         dtype.get_pointer_inner().unwrap(),
                         context,
-                        false,
+                        !no_deref,
                     ),
                     Some(op),
                 )
@@ -1745,7 +1815,25 @@ impl IrgenFunc<'_> {
                         args,
                         return_type: *ret.clone(),
                     };
-                    context.insert_instruction(inst).unwrap()
+                    let op = context.insert_instruction(inst).unwrap();
+                    if !op.dtype().is_scalar() {
+                        let dtype = op.dtype();
+                        let named = Named::new(Some(self.alloc_tempid()), dtype.clone());
+                        let rid = self.insert_alloc(named.clone());
+                        let ptr = ir::Operand::Register {
+                            rid,
+                            dtype: ir::Dtype::pointer(dtype.clone()),
+                        };
+                        let _ = context
+                            .insert_instruction(Instruction::Store {
+                                ptr: ptr.clone(),
+                                value: op,
+                            })
+                            .unwrap();
+                        load_direct(ptr, !no_deref, context)
+                    } else {
+                        op
+                    }
                 } else {
                     unreachable!("{callee:?}")
                 };
@@ -2232,20 +2320,6 @@ fn op_to_cond(expr: &Expression, orig: ir::Operand, context: &mut Context) -> ir
         context.insert_instruction(cmp).unwrap()
     } else {
         op
-    }
-}
-
-fn is_simple_expr(expr: &Expression) -> bool {
-    match expr {
-        Expression::Identifier(..)
-        | Expression::Constant(..)
-        | Expression::StringLiteral(..)
-        | Expression::SizeOfTy(..)
-        | Expression::SizeOfVal(..)
-        | Expression::AlignOf(..)
-        | Expression::Comma(..)
-        | Expression::OffsetOf(..) => true,
-        _ => false,
     }
 }
 
