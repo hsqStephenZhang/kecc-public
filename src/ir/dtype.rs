@@ -858,6 +858,14 @@ impl Dtype {
         }
     }
 
+        #[inline]
+    pub fn is_struct(&self) -> bool {
+        match self {
+            Self::Struct { .. } => true,
+            _ => false,
+        }
+    }
+
     #[inline]
     pub fn is_int_signed(&self) -> bool {
         match self {
@@ -882,6 +890,11 @@ impl Dtype {
         } else {
             false
         }
+    }
+
+        #[inline]
+    pub fn is_unit(&self) -> bool {
+        matches!(self, Self::Unit { .. })
     }
 
     #[inline]

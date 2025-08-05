@@ -22,7 +22,7 @@ impl WriteLine for TranslationUnit {
                         if let Some(name) = field.name() {
                             name
                         } else {
-                            "%anon" 
+                            "%anon"
                         },
                         field.deref()
                     ))
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn test_writeir() -> io::Result<()> {
         let mut stdout = stdout();
-        let file = "struct4";
+        let file = "struct";
         let c_path = format!("{C_DIR}{file}.c");
         let ir_path = format!("{IR_DIR}{file}.ir");
         let c_file = Path::new(&c_path);
@@ -193,13 +193,13 @@ mod tests {
         ir.write_line(0, &mut stdout)?;
         stdout.flush()?;
 
-        let res= ir::interp(&ir, vec![]);
-        println!("res: {:?}" ,res);
+        let res = ir::interp(&ir, vec![]);
+        println!("res: {:?}", res);
 
-        // let unit = IrParse {}
-        //     .translate(&ir_file)
-        //     .unwrap_or_else(|_| panic!("parse failed {}", ir_file.display()));
-        // assert!(unit.is_equiv(&ir));
+        let unit = IrParse {}
+            .translate(&ir_file)
+            .unwrap_or_else(|_| panic!("parse failed {}", ir_file.display()));
+        assert!(unit.is_equiv(&ir));
 
         // writeln!(stdout, "\nir gen by ir parse:");
         // // writeln!(stdout, "{:?}", unit);

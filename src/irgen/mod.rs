@@ -848,16 +848,28 @@ impl IrgenFunc<'_> {
                         dtype: ir::Dtype::pointer(element_dtype.clone()),
                     };
                     let actual_ptr = context.insert_instruction(inst).unwrap();
+                    let size_of_element = element_dtype.size_align_of(self.structs).unwrap().0;
 
-                    let mut offset = 0;
-                    for item in nodes.iter() {
-                        let offset_op =
-                            ir::Operand::constant(ir::Constant::int(offset, ir::Dtype::int(64)));
+                    for (idx, item) in nodes.iter().enumerate() {
+                        let offset = context
+                            .insert_instruction(Instruction::BinOp {
+                                op: BinaryOperator::Multiply,
+                                lhs: ir::Operand::constant(ir::Constant::int(
+                                    idx as _,
+                                    ir::Dtype::IPOINTER,
+                                )),
+                                rhs: ir::Operand::constant(ir::Constant::int(
+                                    size_of_element as _,
+                                    ir::Dtype::int(64),
+                                )),
+                                dtype: ir::Dtype::IPOINTER,
+                            })
+                            .unwrap();
 
                         let inst = Instruction::GetElementPtr {
                             ptr: actual_ptr.clone(),
-                            offset: offset_op,
-                            dtype: ir::Dtype::pointer(dtype.clone()),
+                            offset,
+                            dtype: ir::Dtype::pointer(element_dtype.clone()),
                         };
                         let field_ptr = context.insert_instruction(inst).unwrap();
                         self.translate_initializer(
@@ -866,11 +878,9 @@ impl IrgenFunc<'_> {
                             &item.node.initializer.node,
                             context,
                         )?;
-                        offset += element_dtype.size_align_of(self.structs).unwrap().0 as u128;
                     }
                 } else {
                     let fields = dtype.get_struct_fields2(self.structs).unwrap();
-                    dbg!(&fields);
                     let mut idx = 0;
                     for item in nodes.iter() {
                         let offset_and_dtype = if item.node.designation.is_empty() {
@@ -945,7 +955,7 @@ impl IrgenFunc<'_> {
             }
             Statement::Expression(node) => {
                 if let Some(node) = node {
-                    let _ = self.translate_expr(&node.node, false, context)?;
+                    let _ = self.translate_expr(&node.node, true, context)?;
                 }
             }
 
@@ -1816,7 +1826,7 @@ impl IrgenFunc<'_> {
                         return_type: *ret.clone(),
                     };
                     let op = context.insert_instruction(inst).unwrap();
-                    if !op.dtype().is_scalar() {
+                    if no_deref && !op.dtype().is_unit() {
                         let dtype = op.dtype();
                         let named = Named::new(Some(self.alloc_tempid()), dtype.clone());
                         let rid = self.insert_alloc(named.clone());
@@ -1830,7 +1840,7 @@ impl IrgenFunc<'_> {
                                 value: op,
                             })
                             .unwrap();
-                        load_direct(ptr, !no_deref, context)
+                        ptr
                     } else {
                         op
                     }
