@@ -6,7 +6,7 @@ rm -f out*.txt
 #ulimit -v 2000000                                                                                                                                                                                          
 
 if
-  (! gcc -Wall -Wextra test_reduced.c > out_gcc.txt 2>&1 ||\
+  (! gcc -Wextra test_reduced.c > out_gcc.txt 2>&1 ||\
   ! $KECC_BIN --parse test_reduced.c >/dev/null 2>&1)
 then
   exit 1
@@ -14,7 +14,7 @@ fi
 
 if
   [ $FUZZ_ARG = '-i' ] &&\
-  (! clang -pedantic -Wall -Werror=strict-prototypes -c test_reduced.c > out_clang.txt 2>&1 ||\
+  (! clang -pedantic -Werror=strict-prototypes -c test_reduced.c > out_clang.txt 2>&1 ||\
   grep 'main-return-type' out_clang.txt ||\
   grep 'conversions than data arguments' out_clang.txt ||\
   grep 'int-conversion' out_clang.txt ||\

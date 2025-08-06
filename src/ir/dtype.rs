@@ -746,6 +746,15 @@ impl Dtype {
         }
     }
 
+        #[inline]
+    pub fn get_int_sign(&self) -> Option<bool> {
+        if let Self::Int { is_signed, .. } = self {
+            Some(*is_signed)
+        } else {
+            None
+        }
+    }
+
     #[inline]
     pub fn get_float_width(&self) -> Option<usize> {
         if let Self::Float { width, .. } = self {
@@ -1611,7 +1620,8 @@ impl Dtype {
             }
 
             ast::BinaryOperator::ShiftLeft | ast::BinaryOperator::ShiftRight => {
-                Some((Self::INT, Self::INT))
+                let operand_dtype = self.arithmatic(r_type);
+                Some((operand_dtype.clone(), operand_dtype))
             }
 
             ast::BinaryOperator::Less

@@ -223,8 +223,11 @@ mod tests {
     }
 
     #[test]
-    fn test_once() -> io::Result<()> {
-        test_writeir("float2")?;
+    fn test_reduce() -> io::Result<()> {
+        // run_testcase("reduced")?;
+        // test_writeir("reduced2")?;
+        // test_writeir("polished")?;
+        // test_writeir("reduced3")?;
         Ok(())
     }
 
@@ -268,6 +271,7 @@ mod tests {
         test_writeir("pointer");
         test_writeir("return_void");
         test_writeir("shift");
+        test_writeir("side_effect");
         test_writeir("simple");
         test_writeir("simple_cond");
         test_writeir("simple_for");
@@ -315,12 +319,32 @@ mod tests {
             .translate(&ir_file)
             .unwrap_or_else(|_| panic!("parse failed {}", ir_file.display()));
 
-        // assert!(unit.is_equiv(&ir));
+        assert!(unit.is_equiv(&ir));
 
         // writeln!(stdout, "\nir gen by ir parse:");
         // // writeln!(stdout, "{:?}", unit);
         // unit.write_line(0, &mut stdout)?;
 
+        Ok(())
+    }
+
+    fn run_testcase(file: &str) -> io::Result<()> {
+        let mut stdout = stdout();
+        let c_path = format!("{C_DIR}{file}.c");
+        let ir_path = format!("{IR_DIR}{file}.ir");
+        let c_file = Path::new(&c_path);
+        let ir_file = Path::new(&ir_path);
+
+        let parse = Parse {}.translate(&c_file).expect("parse failed");
+        // println!("{}", json!(parse));
+
+        let ir = Irgen::default().translate(&parse).expect("irgen failed");
+        writeln!(stdout, "ir gen of {} by us:", file);
+        ir.write_line(0, &mut stdout)?;
+        stdout.flush()?;
+
+        let res = ir::interp(&ir, vec![]);
+        println!("res: {:?}", res);
         Ok(())
     }
 }

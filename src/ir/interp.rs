@@ -431,19 +431,26 @@ mod calculator {
                 }
             }
             ast::BinaryOperator::Divide => {
-                assert!(rhs != 0);
-                if is_signed {
-                    (lhs as i128 / rhs as i128) as u128
+                if rhs == 0 {
+                    u128::MAX
                 } else {
-                    lhs / rhs
+                    if is_signed {
+                        (lhs as i128 / rhs as i128) as u128
+                    } else {
+                        lhs / rhs
+                    }
                 }
             }
             ast::BinaryOperator::Modulo => {
-                assert!(rhs != 0);
-                if is_signed {
-                    (lhs as i128 % rhs as i128) as u128
+                // assert!(rhs != 0);
+                if rhs == 0 {
+                    lhs
                 } else {
-                    lhs % rhs
+                    if is_signed {
+                        (lhs as i128 % rhs as i128) as u128
+                    } else {
+                        lhs % rhs
+                    }
                 }
             }
             ast::BinaryOperator::ShiftLeft => {

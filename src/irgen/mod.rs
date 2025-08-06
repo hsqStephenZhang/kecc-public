@@ -961,7 +961,7 @@ impl IrgenFunc<'_> {
             ///     ...
             Statement::If(node) => {
                 let condition = &node.node.condition;
-                let (op, _) = self.translate_expr(&condition.node, true, context)?;
+                let (op, _) = self.translate_expr(&condition.node, false, context)?;
                 let op = op_to_cond(op, context);
 
                 let mut ctx_then = Context::new(self.alloc_bid());
@@ -1580,6 +1580,17 @@ impl IrgenFunc<'_> {
                     };
                     (context.insert_instruction(inst).unwrap(), None)
                 }
+                UnaryOperator::Negate => {
+                    let (op, _) = self.translate_expr(&expr.operand.node, false, context)?;
+                    let dtype = ir::Dtype::BOOL;
+                    let op = cast(op, &dtype, context);
+                    let inst = Instruction::UnaryOp {
+                        op: expr.operator.node,
+                        operand: op,
+                        dtype,
+                    };
+                    (context.insert_instruction(inst).unwrap(), None)
+                }
                 _ => {
                     // others are not left value
                     let (op, _) = self.translate_expr(&expr.operand.node, false, context)?;
@@ -1624,6 +1635,8 @@ impl IrgenFunc<'_> {
             let lhs = cast(lhs, &op_dtype, context);
             let rhs = cast(rhs, &op_dtype, context);
             // %1
+            assert_eq!(lhs.dtype().get_int_width(), rhs.dtype().get_int_width());
+            assert_eq!(lhs.dtype().get_int_sign(), rhs.dtype().get_int_sign());
             let compute = Instruction::BinOp {
                 op: assign_op,
                 lhs,
@@ -1705,7 +1718,8 @@ impl IrgenFunc<'_> {
 
                     let lhs = cast(lhs, &operand_dtype, context);
                     let rhs = cast(rhs, &operand_dtype, context);
-                    // let dtype = binop_dtype(&operand_dtype, &expr.operator.node);
+                    assert_eq!(lhs.dtype().get_int_width(), rhs.dtype().get_int_width());
+                    assert_eq!(lhs.dtype().get_int_sign(), rhs.dtype().get_int_sign());
 
                     let inst = Instruction::BinOp {
                         op: expr.operator.node,
@@ -1993,10 +2007,11 @@ impl IrgenFunc<'_> {
                 // 2. else expr
                 let (op, _) =
                     self.translate_expr(&node.node.else_expression.node, false, &mut ctx_else)?;
+                let value = cast(op, &dtype, &mut ctx_else);
                 // TODO: doe we need to cast type here?
                 let store1 = Instruction::Store {
                     ptr: ptr.clone(),
-                    value: op,
+                    value,
                 };
                 ctx_else.insert_instruction(store1);
                 self.insert_block(
@@ -2330,60 +2345,25 @@ fn op_to_cond(orig: ir::Operand, context: &mut Context) -> ir::Operand {
     };
 
     // 2. cmp with int zero(of the same width)
-    if let ir::Dtype::Int { width, .. } = op.dtype()
+    if let ir::Dtype::Int {
+        width, is_signed, ..
+    } = op.dtype()
         && width != 1
     {
-        let zero = ir::Constant::int(0, ir::Dtype::int(width));
+        let zero = ir::Constant::int(0, ir::Dtype::int(width).signed(is_signed));
+        let lhs = op;
+        let rhs = ir::Operand::constant(zero);
+        assert_eq!(lhs.dtype().get_int_sign(), rhs.dtype().get_int_sign());
         let cmp = Instruction::BinOp {
             op: BinaryOperator::NotEquals,
-            lhs: op,
-            rhs: ir::Operand::constant(zero),
+            lhs,
+            rhs,
             dtype: ir::Dtype::BOOL,
         };
+
         context.insert_instruction(cmp).unwrap()
     } else {
         op
-    }
-}
-
-fn binop_dtype(operand_dtype: &ir::Dtype, operator: &BinaryOperator) -> ir::Dtype {
-    match operator {
-        BinaryOperator::Less
-        | BinaryOperator::Greater
-        | BinaryOperator::LessOrEqual
-        | BinaryOperator::GreaterOrEqual
-        | BinaryOperator::Equals
-        | BinaryOperator::NotEquals => ir::Dtype::BOOL,
-
-        // arithmatic
-        BinaryOperator::Multiply
-        | BinaryOperator::Divide
-        | BinaryOperator::Modulo
-        | BinaryOperator::Plus
-        | BinaryOperator::Minus
-        | BinaryOperator::ShiftLeft
-        | BinaryOperator::ShiftRight
-        | BinaryOperator::AssignMultiply
-        | BinaryOperator::AssignDivide
-        | BinaryOperator::AssignModulo
-        | BinaryOperator::AssignPlus
-        | BinaryOperator::AssignMinus
-        | BinaryOperator::AssignShiftLeft
-        | BinaryOperator::AssignShiftRight
-        | BinaryOperator::AssignBitwiseAnd
-        | BinaryOperator::AssignBitwiseXor
-        | BinaryOperator::AssignBitwiseOr => operand_dtype.clone(),
-
-        BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseXor | BinaryOperator::BitwiseOr => {
-            ir::Dtype::int(32)
-        }
-
-        BinaryOperator::Assign => ir::Dtype::unit(),
-
-        // should not be called
-        BinaryOperator::Index => todo!(),
-        BinaryOperator::LogicalAnd => todo!(),
-        BinaryOperator::LogicalOr => todo!(),
     }
 }
 

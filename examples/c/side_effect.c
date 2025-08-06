@@ -6,8 +6,6 @@ int* foo() {
 }
 
 int main() {
-    // `foo()` should be called once.
-    *&*foo() += 1;
     *&*foo() += 1;
 
     return g;
