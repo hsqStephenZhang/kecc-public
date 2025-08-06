@@ -1,6 +1,9 @@
 //! KECC: KAIST Educational C Compiler.
 
 #![deny(clippy::all)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::unbuffered_bytes)]
+#![allow(clippy::uninlined_format_args)]
 // #![deny(rustdoc::all)]
 #![deny(warnings)]
 // Tries to deny all rustc allow lints.

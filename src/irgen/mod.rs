@@ -38,6 +38,7 @@ use core::cmp::Ordering;
 use core::convert::TryFrom;
 use core::{fmt, mem};
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::ops::Deref;
 
 use itertools::{Either, izip};
@@ -609,8 +610,6 @@ impl IrgenFunc<'_> {
         }
     }
 
-    /// utils
-
     fn find_symbol(&self, name: &str) -> Option<&ir::Operand> {
         for tbl in self.symbol_table.iter().rev() {
             if let Some(v) = tbl.get(name) {
@@ -658,13 +657,7 @@ impl IrgenFunc<'_> {
                 let op = self.type_of_expr(&node.node.operand.node);
                 op.map(|dtype| match &node.node.operator.node {
                     UnaryOperator::Address => Some(ir::Dtype::pointer(dtype)),
-                    UnaryOperator::Indirection => {
-                        if let Some(ptr) = dtype.get_pointer_inner() {
-                            Some(ptr.clone())
-                        } else {
-                            None
-                        }
-                    }
+                    UnaryOperator::Indirection => dtype.get_pointer_inner().cloned(),
                     _ => Some(dtype),
                 })
                 .unwrap_or_default()
@@ -673,14 +666,11 @@ impl IrgenFunc<'_> {
                 let types = self
                     .type_of_expr(&node.node.lhs.node)
                     .zip(self.type_of_expr(&node.node.rhs.node));
-                let t = types.and_then(|(t1, t2)| Some(basic_type_promotion(&t1, &t2)));
-                t
+                types.map(|(t1, t2)| basic_type_promotion(&t1, &t2))
             }
             _ => unreachable!("invalid or unsupported expr in sizeof, expr:{:?}", expr),
         }
     }
-
-    /// utils end
 
     /// Enter a scope and create a new symbol table entry, i.e, we are at a `{` in the function.
     fn enter_scope(&mut self) {
@@ -731,7 +721,7 @@ impl IrgenFunc<'_> {
                     IrgenErrorMessage::InvalidDtype { dtype_error: e },
                 )
             })?;
-        let base_dtype = base_dtype.resolve_typedefs(&self.typedefs).map_err(|e| {
+        let base_dtype = base_dtype.resolve_typedefs(self.typedefs).map_err(|e| {
             IrgenError::new(
                 format!("{source:#?}"),
                 IrgenErrorMessage::InvalidDtype { dtype_error: e },
@@ -753,13 +743,13 @@ impl IrgenFunc<'_> {
                 })?
                 .deref()
                 .clone();
-            let dtype = dtype.resolve_typedefs(&self.typedefs).map_err(|e| {
+            let dtype = dtype.resolve_typedefs(self.typedefs).map_err(|e| {
                 IrgenError::new(
                     format!("{source:#?}"),
                     IrgenErrorMessage::InvalidDtype { dtype_error: e },
                 )
             })?;
-            if !is_typedef && is_invalid_structure(&dtype, &self.structs) {
+            if !is_typedef && is_invalid_structure(&dtype, self.structs) {
                 return Err(IrgenError::new(
                     format!("{source:#?}"),
                     IrgenErrorMessage::Misc {
@@ -830,7 +820,7 @@ impl IrgenFunc<'_> {
             Initializer::Expression(node) => {
                 let value = self.translate_expr(&node.node, false, context)?.0;
                 // assign cast2: initialization
-                let value = cast(value, &dtype, context);
+                let value = cast(value, dtype, context);
                 let inst = Instruction::Store {
                     ptr: ptr.clone(),
                     value,
@@ -881,25 +871,22 @@ impl IrgenFunc<'_> {
                     }
                 } else {
                     let fields = dtype.get_struct_fields2(self.structs).unwrap();
-                    let mut idx = 0;
-                    for item in nodes.iter() {
+                    for (idx, item) in nodes.iter().enumerate() {
                         let offset_and_dtype = if item.node.designation.is_empty() {
                             let mut name = None;
                             let name_or_index = match fields[idx].name().cloned() {
                                 Some(s) => {
                                     name = Some(s);
-                                    Either::Left(name.as_ref().map(|s| s.as_str()).unwrap())
+                                    Either::Left(name.as_deref().unwrap())
                                 }
                                 None => Either::Right(idx),
                             };
                             dtype.get_offset_struct_field_flat(name_or_index, self.structs)
+                        } else if let Designator::Member(member) = &item.node.designation[0].node {
+                            let name = member.node.name.as_str();
+                            dtype.get_offset_struct_field_flat(Either::Left(name), self.structs)
                         } else {
-                            if let Designator::Member(member) = &item.node.designation[0].node {
-                                let name = member.node.name.as_str();
-                                dtype.get_offset_struct_field_flat(Either::Left(name), self.structs)
-                            } else {
-                                unreachable!()
-                            }
+                            unreachable!()
                         };
                         let (offset, dtype) = offset_and_dtype.unwrap();
                         let offset = ir::Operand::constant(ir::Constant::int(
@@ -918,7 +905,6 @@ impl IrgenFunc<'_> {
                             &item.node.initializer.node,
                             context,
                         )?;
-                        idx += 1;
                     }
                 }
             }
@@ -976,7 +962,7 @@ impl IrgenFunc<'_> {
             Statement::If(node) => {
                 let condition = &node.node.condition;
                 let (op, _) = self.translate_expr(&condition.node, true, context)?;
-                let op = op_to_cond(&node.node.condition.node, op, context);
+                let op = op_to_cond(op, context);
 
                 let mut ctx_then = Context::new(self.alloc_bid());
                 let mut ctx_else = Context::new(self.alloc_bid());
@@ -1128,7 +1114,7 @@ impl IrgenFunc<'_> {
                 // 1. cond
                 let (op, _) =
                     self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
-                let op = op_to_cond(&node.node.expression.node, op, context);
+                let op = op_to_cond(op, &mut ctx_cond);
                 let exit = ir::BlockExit::ConditionalJump {
                     condition: op,
                     arg_then: jmp_body.clone(),
@@ -1206,7 +1192,7 @@ impl IrgenFunc<'_> {
                 // 2. cond
                 let (op, _) =
                     self.translate_expr(&node.node.expression.node, false, &mut ctx_cond)?;
-                let op = op_to_cond(&node.node.expression.node, op, context);
+                let op = op_to_cond(op, context);
                 let exit = ir::BlockExit::ConditionalJump {
                     condition: op,
                     arg_then: jmp_body.clone(),
@@ -1279,7 +1265,7 @@ impl IrgenFunc<'_> {
                 // 2. cond
                 if let Some(cond) = &node.node.condition {
                     let (op, _) = self.translate_expr(&cond.node, true, &mut ctx_cond)?;
-                    let op = op_to_cond(&cond.node, op, context);
+                    let op = op_to_cond(op, context);
                     let exit = ir::BlockExit::ConditionalJump {
                         condition: op,
                         arg_then: jmp_body.clone(),
@@ -1413,7 +1399,7 @@ impl IrgenFunc<'_> {
 
             if op == &BinaryOperator::LogicalAnd {
                 let (op, _) = self.translate_expr(expr, false, &mut c1)?;
-                let op = cast(op, &dtype, &mut c1);
+                let op = op_to_cond(op, &mut c1);
                 c1.insert_instruction(Instruction::Store {
                     ptr: ptr.clone(),
                     value: op,
@@ -1432,7 +1418,7 @@ impl IrgenFunc<'_> {
                 });
 
                 let (op, _) = self.translate_expr(expr, false, &mut c2)?;
-                let op = cast(op, &dtype, &mut c2);
+                let op = op_to_cond(op, &mut c2);
                 c2.insert_instruction(Instruction::Store {
                     ptr: ptr.clone(),
                     value: op,
@@ -1456,7 +1442,7 @@ impl IrgenFunc<'_> {
                 .insert_instruction(Instruction::Load { ptr: ptr.clone() })
                 .unwrap();
 
-            match next_jmp.clone() {
+            match next_jmp {
                 Some(jmp) => {
                     let arg_then = JumpArg::new(ir::BlockId(jmp), vec![]);
                     let arg_else = JumpArg::new(ir::BlockId(jmp + 1), vec![]);
@@ -1518,7 +1504,7 @@ impl IrgenFunc<'_> {
                 // %b3:i2:i32* = getelementptr %b3:i0:i32* offset %b3:i1:i64
                 // %b3:i3:unit = store %b3:i2:i32* %l1:i32**
                 // return %b3:i0:i32*
-                let (size, _) = inner_dtype.size_align_of(&self.structs).unwrap();
+                let (size, _) = inner_dtype.size_align_of(self.structs).unwrap();
 
                 let offset = context
                     .insert_instruction(Instruction::BinOp {
@@ -1582,12 +1568,24 @@ impl IrgenFunc<'_> {
                         (value, Some(orig_value))
                     }
                 }
+                UnaryOperator::Complement => {
+                    let (lhs, _) = self.translate_expr(&expr.operand.node, false, context)?;
+                    let dtype = lhs.dtype();
+                    let rhs = ir::Operand::constant(ir::Constant::int(u128::MAX, dtype.clone()));
+                    let inst = Instruction::BinOp {
+                        op: BinaryOperator::BitwiseXor,
+                        lhs,
+                        rhs,
+                        dtype,
+                    };
+                    (context.insert_instruction(inst).unwrap(), None)
+                }
                 _ => {
                     // others are not left value
                     let (op, _) = self.translate_expr(&expr.operand.node, false, context)?;
                     let dtype = op.dtype();
                     let inst = Instruction::UnaryOp {
-                        op: expr.operator.node.clone(),
+                        op: expr.operator.node,
                         operand: op,
                         dtype,
                     };
@@ -1619,19 +1617,22 @@ impl IrgenFunc<'_> {
             let (lhs, lvalue) = self.translate_expr(&expr.lhs.node, false, context)?;
             let (rhs, _) = self.translate_expr(&expr.rhs.node, false, context)?;
             let lvalue = lvalue.unwrap();
-            let dtype = lhs.dtype();
+            let target_dtype = lhs.dtype();
+            let op_dtype = lhs.dtype().arithmatic(&rhs.dtype());
             // let dtype = dtype_ptr.get_pointer_inner().cloned().unwrap();
             // assign cast1: assignment operator
-            let rhs = cast(rhs, &dtype, context);
+            let lhs = cast(lhs, &op_dtype, context);
+            let rhs = cast(rhs, &op_dtype, context);
             // %1
             let compute = Instruction::BinOp {
                 op: assign_op,
                 lhs,
                 rhs,
-                dtype,
+                dtype: op_dtype,
             };
             // %2
             let op2 = context.insert_instruction(compute).unwrap();
+            let op2 = cast(op2, &target_dtype, context);
             let _ = context.insert_instruction(Instruction::Store {
                 ptr: lvalue,
                 value: op2.clone(),
@@ -1707,7 +1708,7 @@ impl IrgenFunc<'_> {
                     // let dtype = binop_dtype(&operand_dtype, &expr.operator.node);
 
                     let inst = Instruction::BinOp {
-                        op: expr.operator.node.clone(),
+                        op: expr.operator.node,
                         lhs,
                         rhs,
                         dtype: result_dtype,
@@ -1734,11 +1735,12 @@ impl IrgenFunc<'_> {
         // TODO: conditional expr
         let (op, ptr) = match expr {
             Expression::Identifier(node) => {
-                let op = self.find_symbol(&node.node.name).cloned().expect(&format!(
-                    "{}, symbol table: {:?}",
-                    json!(expr),
-                    self.symbol_table
-                ));
+                let op = self
+                    .find_symbol(&node.node.name)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!("{}, symbol table: {:?}", json!(expr), self.symbol_table)
+                    });
                 let should_load = !no_deref && (op.is_global() || op.is_alloc() || op.is_arg());
                 (load_direct(op.clone(), should_load, context), Some(op))
             }
@@ -1770,11 +1772,15 @@ impl IrgenFunc<'_> {
             }
             Expression::Member(node) => {
                 // TODO: make it readable
-                let (struct_ptr, _) =
+                let (mut struct_ptr, _) =
                     self.translate_expr(&node.node.expression.node, true, context)?;
+                if node.node.operator.node == MemberOperator::Indirect {
+                    struct_ptr = load_direct(struct_ptr, true, context);
+                }
                 let member = node.node.identifier.node.name.clone();
                 let dtype = struct_ptr.dtype();
                 let struct_dtype = dtype.get_pointer_inner().unwrap();
+
                 let struct_name = struct_dtype.get_struct_name().unwrap().clone().unwrap();
                 let struct_real_dtype = self.structs.get(&struct_name).unwrap().clone().unwrap();
                 let (offset, dtype) = struct_real_dtype
@@ -1804,13 +1810,16 @@ impl IrgenFunc<'_> {
                 // callee can be either
                 // 1. a global variable of function
                 // 2. a function pointer
+                // dbg!(node, no_deref);
                 let (callee, _) = self.translate_expr(&node.node.callee.node, true, context)?;
-                let mut dtype = callee.dtype();
-                if let Some(inner) = dtype.get_pointer_inner() {
-                    dtype = inner.clone()
+                let mut ptr_to_fn = callee.dtype();
+                // dbg!(&ptr_to_fn, no_deref);
+                let fn_dtype = match ptr_to_fn.get_pointer_inner().cloned() {
+                    Some(i) => i,
+                    None => ptr_to_fn,
                 };
 
-                let op = if let ir::Dtype::Function { ret, params } = &dtype {
+                let op = if let ir::Dtype::Function { ret, params } = &fn_dtype {
                     let mut args = vec![];
                     assert_eq!(params.len(), node.node.arguments.len());
                     for (expr, target_dtype) in node.node.arguments.iter().zip(params) {
@@ -1826,7 +1835,8 @@ impl IrgenFunc<'_> {
                         return_type: *ret.clone(),
                     };
                     let op = context.insert_instruction(inst).unwrap();
-                    if no_deref && !op.dtype().is_unit() {
+                    // dbg!(&op.dtype());
+                    if no_deref && !op.dtype().is_unit() && !op.dtype().is_fn_pointer() {
                         let dtype = op.dtype();
                         let named = Named::new(Some(self.alloc_tempid()), dtype.clone());
                         let rid = self.insert_alloc(named.clone());
@@ -1875,7 +1885,7 @@ impl IrgenFunc<'_> {
             }
             Expression::SizeOfVal(node) => {
                 let dtype = self.type_of_expr(&node.node.0.node).unwrap();
-                let (size, _) = dtype.size_align_of(&self.structs).unwrap();
+                let (size, _) = dtype.size_align_of(self.structs).unwrap();
                 (
                     ir::Operand::constant(ir::Constant::int(
                         size as _,
@@ -1927,7 +1937,7 @@ impl IrgenFunc<'_> {
             ///     after
             Expression::Conditional(node) => {
                 let (op, _) = self.translate_expr(&node.node.condition.node, false, context)?;
-                let op = op_to_cond(&node.node.condition.node, op, context);
+                let op = op_to_cond(op, context);
 
                 let mut ctx_then = Context::new(self.alloc_bid());
                 let mut ctx_else = Context::new(self.alloc_bid());
@@ -2104,7 +2114,7 @@ impl IrgenFunc<'_> {
                 dtype: ir::Dtype::pointer(t.clone()),
             };
             let value = ir::Operand::Register {
-                rid: ir::RegisterId::arg(bid_init.clone(), idx),
+                rid: ir::RegisterId::arg(bid_init, idx),
                 dtype: t.clone(),
             };
             // no need to cast
@@ -2279,6 +2289,9 @@ fn identifier(expr: &Expression) -> Option<String> {
 
 fn load_direct(ptr: ir::Operand, should_load: bool, context: &mut Context) -> ir::Operand {
     if should_load {
+        if ptr.dtype().is_fn_pointer() {
+            return ptr;
+        }
         let inner = ptr.dtype().get_pointer_inner().cloned().unwrap();
         if let Some(d) = inner.get_array_inner() {
             let element = Instruction::GetElementPtr {
@@ -2297,7 +2310,7 @@ fn load_direct(ptr: ir::Operand, should_load: bool, context: &mut Context) -> ir
 }
 
 fn cast(orig: ir::Operand, target_dtype: &ir::Dtype, context: &mut Context) -> ir::Operand {
-    if orig.dtype() == *target_dtype {
+    if orig.dtype() == *target_dtype || orig.dtype().canon_eq(target_dtype) {
         orig
     } else {
         let cast_inst = Instruction::TypeCast {
@@ -2308,7 +2321,7 @@ fn cast(orig: ir::Operand, target_dtype: &ir::Dtype, context: &mut Context) -> i
     }
 }
 
-fn op_to_cond(expr: &Expression, orig: ir::Operand, context: &mut Context) -> ir::Operand {
+fn op_to_cond(orig: ir::Operand, context: &mut Context) -> ir::Operand {
     // 1. cast to int first
     let op = if !matches!(orig.dtype(), ir::Dtype::Int { .. }) {
         cast(orig, &ir::Dtype::int(32), context)
@@ -2415,25 +2428,26 @@ fn type_size(t: &TypeSpecifier) -> Option<usize> {
 
 /// 1. one of them is float
 fn basic_type_promotion(l_type: &ir::Dtype, r_type: &ir::Dtype) -> ir::Dtype {
-    if l_type == r_type {
-        l_type.clone()
-    } else if l_type.is_int(None) && r_type.is_int(None) {
-        let l_size = l_type.get_int_width().unwrap();
-        let r_size = r_type.get_int_width().unwrap();
-        if l_size > r_size {
-            l_type.clone()
-        } else if l_size < r_size {
-            r_type.clone()
-        } else {
-            if l_type.is_int_signed() && !r_type.is_int_signed() {
-                r_type.clone()
-            } else {
-                l_type.clone()
-            }
-        }
-    } else {
-        unreachable!("unsupported type promotion, {:?}, {:?}", l_type, r_type)
-    }
+    l_type.arithmatic(r_type)
+    // if l_type == r_type {
+    //     l_type.clone()
+    // } else if l_type.is_int(None) && r_type.is_int(None) {
+    //     let l_size = l_type.get_int_width().unwrap();
+    //     let r_size = r_type.get_int_width().unwrap();
+    //     if l_size > r_size {
+    //         l_type.clone()
+    //     } else if l_size < r_size {
+    //         r_type.clone()
+    //     } else {
+    //         if l_type.is_int_signed() && !r_type.is_int_signed() {
+    //             r_type.clone()
+    //         } else {
+    //             l_type.clone()
+    //         }
+    //     }
+    // } else {
+    //     unreachable!("unsupported type promotion, {:?}, {:?}", l_type, r_type)
+    // }
 }
 
 fn type_align(t: &TypeSpecifier) -> Option<usize> {
@@ -2465,7 +2479,7 @@ fn collect_logic_leaf_expr<'a>(
     {
         collect_logic_leaf_expr(&node.node.lhs.node, collects, operations);
         collect_logic_leaf_expr(&node.node.rhs.node, collects, operations);
-        operations.push(node.node.operator.node.clone());
+        operations.push(node.node.operator.node);
     } else {
         collects.push(expr);
     }

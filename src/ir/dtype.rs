@@ -858,12 +858,9 @@ impl Dtype {
         }
     }
 
-        #[inline]
+    #[inline]
     pub fn is_struct(&self) -> bool {
-        match self {
-            Self::Struct { .. } => true,
-            _ => false,
-        }
+        matches!(self, Self::Struct { .. })
     }
 
     #[inline]
@@ -892,7 +889,7 @@ impl Dtype {
         }
     }
 
-        #[inline]
+    #[inline]
     pub fn is_unit(&self) -> bool {
         matches!(self, Self::Unit { .. })
     }
@@ -900,6 +897,17 @@ impl Dtype {
     #[inline]
     pub fn is_array(&self) -> bool {
         matches!(self, Self::Array { .. })
+    }
+
+    #[inline]
+    pub fn is_fn_pointer(&self) -> bool {
+        if let Self::Pointer { inner, .. } = self
+            && let Self::Function { .. } = inner.as_ref()
+        {
+            true
+        } else {
+            false
+        }
     }
 
     pub fn is_const(&self) -> bool {
@@ -1130,6 +1138,41 @@ impl Dtype {
             None
         } else {
             None
+        }
+    }
+
+    pub fn canon_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pointer { inner, .. }, Self::Pointer { inner: inner2, .. }) => {
+                inner.canon_eq_inner(inner2)
+            }
+            (
+                Self::Array { inner, size },
+                Self::Array {
+                    inner: inner2,
+                    size: size1,
+                },
+            ) => size == size1 && inner.canon_eq_inner(inner2),
+            _ => false,
+        }
+    }
+
+    fn canon_eq_inner(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unit { .. }, Self::Unit { .. }) => true,
+            (Self::Int { width, .. }, Self::Int { width: width1, .. }) => *width == *width1,
+            (Self::Float { width, .. }, Self::Float { width: width1, .. }) => *width == *width1,
+            (Self::Pointer { inner, .. }, Self::Pointer { inner: inner2, .. }) => {
+                inner.canon_eq_inner(inner2)
+            }
+            (
+                Self::Array { inner, size },
+                Self::Array {
+                    inner: inner2,
+                    size: size1,
+                },
+            ) => size == size1 && inner.canon_eq_inner(inner2),
+            _ => false,
         }
     }
 
@@ -1535,7 +1578,15 @@ impl Dtype {
         match binop {
             ast::BinaryOperator::BitwiseAnd
             | ast::BinaryOperator::BitwiseXor
-            | ast::BinaryOperator::BitwiseOr => return Some((Self::INT, Self::INT)),
+            | ast::BinaryOperator::BitwiseOr => {
+                if self.is_int(Some(32)) {
+                    Some((self.clone(), self.clone()))
+                } else if r_type.is_int(Some(32)) {
+                    Some((r_type.clone(), r_type.clone()))
+                } else {
+                    Some((Self::INT, Self::INT))
+                }
+            }
             ast::BinaryOperator::Multiply
             | ast::BinaryOperator::Divide
             | ast::BinaryOperator::Modulo
@@ -1554,9 +1605,14 @@ impl Dtype {
             | ast::BinaryOperator::AssignShiftRight
             | ast::BinaryOperator::AssignBitwiseAnd
             | ast::BinaryOperator::AssignBitwiseXor
-            | ast::BinaryOperator::AssignBitwiseOr => return Some((self.clone(), self.clone())),
+            | ast::BinaryOperator::AssignBitwiseOr => {
+                let operand_dtype = self.arithmatic(r_type);
+                Some((operand_dtype, self.clone()))
+            }
 
-            ast::BinaryOperator::ShiftLeft | ast::BinaryOperator::ShiftRight => todo!(),
+            ast::BinaryOperator::ShiftLeft | ast::BinaryOperator::ShiftRight => {
+                Some((Self::INT, Self::INT))
+            }
 
             ast::BinaryOperator::Less
             | ast::BinaryOperator::Greater
@@ -1566,7 +1622,7 @@ impl Dtype {
             | ast::BinaryOperator::NotEquals => {
                 // logical
                 let operand_dtype = self.arithmatic(r_type);
-                return Some((operand_dtype, Self::BOOL));
+                Some((operand_dtype, Self::BOOL))
             }
 
             ast::BinaryOperator::Index => todo!(),
@@ -1598,11 +1654,11 @@ impl Dtype {
         }
     }
 
-    fn arithmatic(&self, r_type: &Self) -> Self {
+    pub fn arithmatic(&self, r_type: &Self) -> Self {
         if self.is_float(None) & r_type.is_float(None) {
             let s1 = self.get_float_width().unwrap();
             let s2 = r_type.get_float_width().unwrap();
-            let t = if s1 > s2 {
+            if s1 > s2 {
                 self.clone()
             } else if s1 < s2 {
                 r_type.clone()
@@ -1621,8 +1677,7 @@ impl Dtype {
                     width: *width,
                     is_const: *c1 && *c2,
                 }
-            };
-            t
+            }
         } else if self.is_float(None) | r_type.is_float(None) {
             let t = if self.is_float(None) {
                 self.clone()

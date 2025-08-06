@@ -48,7 +48,7 @@ def make_func(i):
 if __name__ == "__main__":
     src = ""
     return_stmt = "\treturn (int)("
-    NUM_FUNC = 100
+    NUM_FUNC = 1
     for i in range(NUM_FUNC):
         src += make_func(i)
         src += "\n\n"

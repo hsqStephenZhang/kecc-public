@@ -92,7 +92,7 @@ pub fn test_write_c(path: &Path) {
         Ok(res) => res,
         Err(e) => {
             forget(temp_dir);
-            panic!("{:?}", e);
+            panic!("{e:?}");
         }
     };
 
@@ -124,7 +124,7 @@ pub fn test_irgen(path: &Path) {
     let new_c = modify_c(path, rand_num);
     modify_ir(&mut ir, rand_num);
 
-    println!("{}", new_c);
+    println!("{new_c}");
 
     // compile recolved c example
     let temp_dir = tempdir().expect("temp dir creation failed");
@@ -165,6 +165,7 @@ pub fn test_irgen(path: &Path) {
     assert!(status.is_some(), "irgen timed out");
     let status = status.unwrap();
 
+    #[allow(clippy::unbuffered_bytes)]
     assert!(
         child
             .stderr

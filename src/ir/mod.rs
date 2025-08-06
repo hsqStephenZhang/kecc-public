@@ -4,9 +4,9 @@ mod dtype;
 mod equiv;
 mod interp;
 mod parse;
+mod type_system;
 mod visualize;
 mod write_ir;
-mod type_system;
 
 use core::convert::TryFrom;
 use core::fmt;
@@ -495,45 +495,6 @@ impl Operand {
         }
     }
 
-    pub fn binop_dtype(&self, other: &Self, op: &ast::BinaryOperator) -> Option<Dtype> {
-        // match op {
-        //     ast::BinaryOperator::Index => {
-        //         // self must be pointer type
-        //         // will return the deref-ed type
-        //         if let Operand::Register { dtype, .. } = self
-        //             && let Dtype::Pointer { inner, .. } = dtype
-        //         {
-        //             Some(*inner.clone())
-        //         } else {
-        //             None
-        //         }
-        //     }
-        //     ast::BinaryOperator::Less
-        //     | ast::BinaryOperator::LessOrEqual
-        //     | ast::BinaryOperator::Greater
-        //     | ast::BinaryOperator::GreaterOrEqual
-        //     | ast::BinaryOperator::Equals
-        //     | ast::BinaryOperator::NotEquals
-        //     | ast::BinaryOperator::LogicalAnd
-        //     | ast::BinaryOperator::LogicalOr => {
-        //         if self.dtype() == other.dtype() {
-        //             Some(Dtype::int(1).signed(false))
-        //         } else {
-        //             None
-        //         }
-        //     }
-        //     _ => {
-        //         if self.dtype() == other.dtype() {
-        //             Some(self.dtype())
-        //         } else {
-        //             None
-        //         }
-        //     }
-        // }
-
-        todo!()
-    }
-
     pub fn local_rid(&self) -> Option<&RegisterId> {
         if let Self::Register { rid, .. } = self {
             if matches!(rid, RegisterId::Local { .. }) {
@@ -846,10 +807,26 @@ impl Constant {
     const HEXADECIMAL: u32 = 16;
     const BINARY: u32 = 2;
 
-    pub const ZERO_U1: Self = Self::Int { value: 0, width: 1, is_signed: false };
-    pub const ONE_U1: Self = Self::Int { value: 1, width: 1, is_signed: false };
-    pub const ZERO_INT: Self = Self::Int { value: 0, width: 32, is_signed: true };
-    pub const ONE_I64: Self = Self::Int { value: 1, width: 64, is_signed: true };
+    pub const ZERO_U1: Self = Self::Int {
+        value: 0,
+        width: 1,
+        is_signed: false,
+    };
+    pub const ONE_U1: Self = Self::Int {
+        value: 1,
+        width: 1,
+        is_signed: false,
+    };
+    pub const ZERO_INT: Self = Self::Int {
+        value: 0,
+        width: 32,
+        is_signed: true,
+    };
+    pub const ONE_I64: Self = Self::Int {
+        value: 1,
+        width: 64,
+        is_signed: true,
+    };
 
     #[inline]
     pub fn is_integer_constant(&self) -> bool {
@@ -1104,7 +1081,7 @@ impl<T> Named<T> {
         self.inner
     }
 
-    pub fn inner(&self) -> &T{
+    pub fn inner(&self) -> &T {
         &self.inner
     }
 }

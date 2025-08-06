@@ -213,7 +213,7 @@ impl WriteString for AvailabilityAttribute {
         let clauses = self
             .clauses
             .iter()
-            .map(|c| format!("{}", c.write_string()))
+            .map(|c| c.write_string())
             .collect::<Vec<_>>()
             .join(", ");
         format!(
@@ -347,7 +347,7 @@ impl WriteString for Declarator {
                     result = format!("*{}{}", qualifier, result);
                 }
                 DerivedDeclarator::Array(node) => {
-                    result.push_str(&format!("{}", node.write_string()));
+                    result.push_str(&node.write_string());
                 }
                 DerivedDeclarator::Function(node) => {
                     result.push_str(&format!("({})", node.write_string()));
@@ -450,7 +450,7 @@ impl WriteString for FunctionDeclarator {
             .join(", ");
         let ellipsis = self.ellipsis.write_string();
         if self.parameters.is_empty() {
-            format!("{}", ellipsis)
+            ellipsis
         } else {
             let ellipsis = if ellipsis.is_empty() {
                 String::new()
@@ -739,7 +739,11 @@ impl WriteString for Float {
             FloatBase::Hexadecimal => "0x",
         };
         let format_suffix = self.suffix.format.write_string();
-        let imagery_suffix = self.suffix.imaginary.then(|| "i").unwrap_or_default();
+        let imagery_suffix = if self.suffix.imaginary {
+            "i"
+        } else {
+            Default::default()
+        };
         format!(
             "{}{}{}{}",
             prefix, self.number, format_suffix, imagery_suffix
@@ -786,7 +790,15 @@ impl WriteString for IntegerSuffix {
             (IntegerSize::LongLong, true) => "ULL",
             (IntegerSize::LongLong, false) => "LL",
         };
-        format!("{}{}", r, self.imaginary.then(|| "i").unwrap_or_default())
+        format!(
+            "{}{}",
+            r,
+            if self.imaginary {
+                "i"
+            } else {
+                Default::default()
+            }
+        )
     }
 }
 
@@ -909,16 +921,16 @@ impl WriteString for AlignOf {
 impl WriteString for UnaryOperatorExpression {
     fn write_string(&self) -> String {
         match self.operator.node {
-            UnaryOperator::Plus => format!("+{}", self.operand.write_string()),
-            UnaryOperator::Minus => format!("-{}", self.operand.write_string()),
-            UnaryOperator::PostIncrement => format!("{}++", self.operand.write_string()),
-            UnaryOperator::PostDecrement => format!("{}--", self.operand.write_string()),
-            UnaryOperator::PreIncrement => format!("++{}", self.operand.write_string()),
-            UnaryOperator::PreDecrement => format!("--{}", self.operand.write_string()),
-            UnaryOperator::Address => format!("&({})", self.operand.write_string()),
-            UnaryOperator::Indirection => format!("*({})", self.operand.write_string()),
-            UnaryOperator::Complement => format!("~({})", self.operand.write_string()),
-            UnaryOperator::Negate => format!("!({})", self.operand.write_string()),
+            UnaryOperator::Plus => format!("(+{})", self.operand.write_string()),
+            UnaryOperator::Minus => format!("(-{})", self.operand.write_string()),
+            UnaryOperator::PostIncrement => format!("({}++)", self.operand.write_string()),
+            UnaryOperator::PostDecrement => format!("({}--)", self.operand.write_string()),
+            UnaryOperator::PreIncrement => format!("(++{})", self.operand.write_string()),
+            UnaryOperator::PreDecrement => format!("(--{})", self.operand.write_string()),
+            UnaryOperator::Address => format!("(&({}))", self.operand.write_string()),
+            UnaryOperator::Indirection => format!("(*({}))", self.operand.write_string()),
+            UnaryOperator::Complement => format!("(~({}))", self.operand.write_string()),
+            UnaryOperator::Negate => format!("(!({}))", self.operand.write_string()),
         }
     }
 }
