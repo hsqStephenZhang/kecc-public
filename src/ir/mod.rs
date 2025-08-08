@@ -190,6 +190,27 @@ pub struct Block {
     pub exit: BlockExit,
 }
 
+impl Block {
+    pub fn relocate(&mut self, new_bid: BlockId, iid_shift: usize, args: Option<&[Operand]>) {
+        // dbg!(new_bid, iid_shift, args);
+        for (idx, insn) in self.instructions.iter_mut().enumerate() {
+            let insn = insn.inner_mut();
+            insn.set_bid_and_iid(new_bid, iid_shift);
+        }
+
+        if !self.phinodes.is_empty() {
+            assert!(args.is_some());
+            let args = args.unwrap();
+            for insn in &mut self.instructions {
+                let insn = insn.inner_mut();
+                insn.apply_args(args);
+            }
+        }
+
+        self.exit.set_op_bid_iid(new_bid, iid_shift);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instruction {
     Nop,
@@ -307,6 +328,66 @@ impl Instruction {
             Instruction::GetElementPtr { ptr, offset, dtype } => {
                 ptr.apply_arg(args);
                 offset.apply_arg(args);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn set_bid_and_iid(&mut self, new_bid: BlockId, new_iid: usize) {
+        match self {
+            Instruction::Value { value } => {
+                value.set_bid(new_bid);
+                value.apply_iid_shift(new_iid);
+            },
+            Instruction::BinOp {
+                op,
+                lhs,
+                rhs,
+                dtype,
+            } => {
+                lhs.set_bid(new_bid);
+                lhs.apply_iid_shift(new_iid);
+                rhs.set_bid(new_bid);
+                rhs.apply_iid_shift(new_iid);
+            }
+            Instruction::UnaryOp { op, operand, dtype } => {
+                operand.set_bid(new_bid);
+                operand.apply_iid_shift(new_iid);
+            }
+            Instruction::Store { ptr, value } => {
+                ptr.set_bid(new_bid);
+                ptr.apply_iid_shift(new_iid);
+                value.set_bid(new_bid);
+                value.apply_iid_shift(new_iid);
+            }
+            Instruction::Load { ptr } => {
+                ptr.set_bid(new_bid);
+                ptr.apply_iid_shift(new_iid);
+            }
+            Instruction::Call {
+                callee,
+                args: ops,
+                return_type,
+            } => {
+                callee.set_bid(new_bid);
+                callee.apply_iid_shift(new_iid);
+                ops.iter_mut().for_each(|op| {
+                    op.set_bid(new_bid);
+                    op.apply_iid_shift(new_iid);
+                });
+            }
+            Instruction::TypeCast {
+                value,
+                target_dtype,
+            } => {
+                value.set_bid(new_bid);
+                value.apply_iid_shift(new_iid);
+            }
+            Instruction::GetElementPtr { ptr, offset, dtype } => {
+                ptr.set_bid(new_bid);
+                ptr.apply_iid_shift(new_iid);
+                offset.set_bid(new_bid);
+                offset.apply_iid_shift(new_iid);
             }
             _ => {}
         }
@@ -443,7 +524,9 @@ impl BlockExit {
         }
     }
 
-    pub fn set_op_bid(&mut self, new_bid: BlockId) {
+    /// replace bid with new_bid
+    /// update iid (if it's a temp operand) with a given offset
+    pub fn set_op_bid_iid(&mut self, new_bid: BlockId, new_iid_offset: usize) {
         let value = match self {
             BlockExit::ConditionalJump {
                 condition,
@@ -460,6 +543,15 @@ impl BlockExit {
         };
         if let Some((rid, _)) = value {
             rid.set_bid(new_bid);
+            rid.set_iid_with_offset(new_iid_offset);
+        }
+    }
+
+    pub fn as_jump(&self) -> Option<&JumpArg> {
+        if let Self::Jump { arg } = self {
+            Some(arg)
+        } else {
+            None
         }
     }
 }
@@ -608,9 +700,43 @@ impl Operand {
         }
     }
 
+    pub fn get_bid_mut(&mut self) -> Option<&mut BlockId> {
+        if let Self::Register { rid, .. } = self {
+            match rid {
+                RegisterId::Local { aid } => None,
+                RegisterId::Arg { bid, .. } | RegisterId::Temp { bid, .. } => Some(bid),
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_iid_mut(&mut self) -> Option<&mut usize> {
+        if let Self::Register { rid, .. } = self {
+            match rid {
+                RegisterId::Temp { iid, .. } => Some(iid),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     pub fn apply_arg(&mut self, args: &[Operand]) {
         if let Some((_, idx)) = self.get_arg() {
             *self = args[*idx].clone();
+        }
+    }
+
+    pub fn set_bid(&mut self, new_bid: BlockId) {
+        if let Some(bid) = self.get_bid_mut() {
+            *bid = new_bid;
+        }
+    }
+
+    pub fn apply_iid_shift(&mut self, iid_shift: usize) {
+        if let Some(iid) = self.get_iid_mut() {
+            *iid += iid_shift;
         }
     }
 }
@@ -685,6 +811,13 @@ impl RegisterId {
         match self {
             RegisterId::Arg { bid, aid } => *bid = new_bid,
             RegisterId::Temp { bid, iid } => *bid = new_bid,
+            _ => {}
+        }
+    }
+
+    pub fn set_iid_with_offset(&mut self, new_iid_offset: usize) {
+        match self {
+            RegisterId::Temp { iid, .. } => *iid += new_iid_offset,
             _ => {}
         }
     }

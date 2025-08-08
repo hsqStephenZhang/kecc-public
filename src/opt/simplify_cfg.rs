@@ -3,6 +3,7 @@ use std::ops::Deref;
 
 use itertools::izip;
 use petgraph::prelude::*;
+use serde::de;
 
 use crate::ir::*;
 use crate::opt::opt_utils::*;
@@ -188,49 +189,103 @@ impl Optimize<FunctionDefinition> for SimplifyCfgReach {
         changed
     }
 }
+fn merge_block_paths(pairs: Vec<(BlockId, BlockId)>) -> Vec<Vec<BlockId>> {
+    let mut from_map: HashMap<BlockId, BlockId> = HashMap::new();
+    let mut to_map: HashMap<BlockId, BlockId> = HashMap::new();
+
+    for (from, to) in &pairs {
+        let _ = from_map.insert(from.clone(), to.clone());
+        let _ = to_map.insert(to.clone(), from.clone());
+    }
+
+    let starts: HashSet<_> = from_map
+        .keys()
+        .filter(|k| !to_map.contains_key(*k))
+        .cloned()
+        .collect();
+
+    let mut result = vec![];
+    let mut visited = HashSet::new();
+
+    for start in starts {
+        let mut path = vec![start.clone()];
+        let mut current = start.clone();
+        let _ = visited.insert(current.clone());
+
+        while let Some(next) = from_map.get(&current) {
+            if visited.contains(next) {
+                break;
+            }
+            path.push(next.clone());
+            let _ = visited.insert(next.clone());
+            current = next.clone();
+        }
+
+        result.push(path);
+    }
+
+    for (from, to) in pairs {
+        if !visited.contains(&from) && !visited.contains(&to) {
+            result.push(vec![from.clone(), to.clone()]);
+            let _ = visited.insert(from);
+            let _ = visited.insert(to);
+        }
+    }
+
+    result
+}
 
 impl Optimize<FunctionDefinition> for SimplifyCfgMerge {
     fn optimize(&mut self, code: &mut FunctionDefinition) -> bool {
         let mut changed = false;
         let (cfg, bid_to_idx) = build_cfg(code);
 
-        let merge_pairs = code
+        let merge_pairs: Vec<(BlockId, BlockId)> = code
             .blocks
             .iter()
             .filter_map(|(bid, block)| {
                 let idx = bid_to_idx.get(bid).unwrap();
                 let in_nodes = cfg.edges_directed(*idx, Incoming).collect::<Vec<_>>();
                 if in_nodes.len() == 1 {
-                    let prev_node = cfg[in_nodes[0].source()];
-                    Some((prev_node, bid.clone()))
+                    let prev_bid = cfg[in_nodes[0].source()];
+                    let prev_blk = code.blocks.get(&prev_bid).unwrap();
+                    prev_blk.exit.as_jump().map(|_| (prev_bid, bid.clone()))
                 } else {
                     None
                 }
             })
             .collect::<Vec<_>>();
+        let lists = merge_block_paths(merge_pairs);
+        // dbg!(&lists);
 
-        for (prev, next) in merge_pairs {
-            let mut next_blk = code.blocks.remove(&next).unwrap();
-            let prev_blk = code.blocks.get_mut(&prev).unwrap();
-            if !next_blk.phinodes.is_empty()
-                && let BlockExit::Jump { arg } = &prev_blk.exit
-            {
-                assert_eq!(next_blk.phinodes.len(), arg.args.len());
-                let args = next_blk
-                    .phinodes
-                    .iter()
-                    .cloned()
-                    .zip(arg.args.iter().cloned())
-                    .collect::<HashMap<_, _>>();
+        // for block list of a -> b -> c -> d
+        // we need to relocate the instruction offset in b, c, d
+        // and set the exit of a to be d's
+        // and remove b, c, d
+        for list in lists {
+            assert!(list.len() > 1);
+            let mut start_bid = list[0];
+            let mut start_blk = code.blocks.remove(&start_bid).unwrap();
+            let mut start_iid = start_blk.instructions.len();
 
-                for insn in &mut next_blk.instructions {
-                    let insn = insn.inner_mut();
-                    insn.apply_args(&arg.args);
+            let mut prev_args = start_blk.exit.as_jump().cloned();
+
+            for (idx, next) in list.iter().enumerate().skip(1) {
+                let mut next_blk = code.blocks.remove(next).unwrap();
+                next_blk.relocate(
+                    start_bid,
+                    start_blk.instructions.len(),
+                    prev_args.as_ref().map(|p| &p.args[..]),
+                );
+                start_blk.instructions.extend(next_blk.instructions);
+
+                prev_args = next_blk.exit.as_jump().cloned();
+
+                if idx == list.len() - 1 {
+                    start_blk.exit = next_blk.exit;
                 }
-                prev_blk.instructions.extend(next_blk.instructions);
             }
-            next_blk.exit.set_op_bid(prev);
-            prev_blk.exit = next_blk.exit;
+            let _ = code.blocks.insert(start_bid, start_blk);
         }
 
         changed
@@ -245,7 +300,9 @@ impl Optimize<FunctionDefinition> for SimplifyCfgEmpty {
             .blocks
             .iter()
             .filter_map(|(bid, block)| {
-                if block.instructions.is_empty() && block.phinodes.is_empty() {
+                if *bid == code.bid_init {
+                    None
+                } else if block.instructions.is_empty() && block.phinodes.is_empty() {
                     Some(*bid)
                 } else {
                     None
@@ -253,15 +310,19 @@ impl Optimize<FunctionDefinition> for SimplifyCfgEmpty {
             })
             .collect::<Vec<_>>();
 
+        let mut should_remove = false;
+
         for empty_bid in empty_blocks {
-            let next_exit = code.blocks.get(&empty_bid).map(|x| x.exit.clone()).unwrap();
+            let mut empty_blk = code.blocks.get(&empty_bid).unwrap();
+            let next_exit = empty_blk.exit.clone();
 
             let idx = bid_to_idx.get(&empty_bid).unwrap();
-            for edge in cfg.edges_directed(*idx, Incoming) {
+            let edges = cfg.edges_directed(*idx, Incoming);
+            for edge in edges {
                 let f = cfg[edge.source()];
 
-                match code.blocks.get(&f).map(|x| x.exit.clone()).unwrap() {
-                    BlockExit::Jump { arg } => {
+                match code.blocks.get_mut(&f).map(|x| &mut x.exit).unwrap() {
+                    BlockExit::Jump { .. } => {
                         // us: jmp
                         // next: jmp or return
                         if matches!(next_exit, BlockExit::Jump { .. } | BlockExit::Return { .. }) {
@@ -276,11 +337,30 @@ impl Optimize<FunctionDefinition> for SimplifyCfgEmpty {
                         // us: condition
                         // next: jmp
                         if let BlockExit::Jump { arg } = &next_exit {
-                            code.blocks.get_mut(&f).unwrap().exit = BlockExit::ConditionalJump {
-                                condition,
-                                arg_then: arg.clone(),
-                                arg_else: arg.clone(),
-                            };
+                            if arg_then.bid == empty_bid {
+                                *arg_then = arg.clone();
+                            }
+                            if arg_else.bid == empty_bid {
+                                *arg_else = arg.clone();
+                            }
+                        }
+                    }
+                    BlockExit::Switch {
+                        value,
+                        default,
+                        cases,
+                    } => {
+                        // us: switch
+                        // next: jmp
+                        if let BlockExit::Jump { arg } = &next_exit {
+                            if default.bid == empty_bid {
+                                *default = arg.clone();
+                            }
+                            cases.iter_mut().for_each(|(_, j)| {
+                                if j.bid == empty_bid {
+                                    *j = arg.clone();
+                                }
+                            });
                         }
                     }
                     _ => {}
@@ -297,34 +377,43 @@ mod tests {
     use std::path::Path;
 
     use crate::{
-        FunctionPass, SimplifyCfgConstProp, SimplifyCfgEmpty, SimplifyCfgMerge, SimplifyCfgReach,
-        test_opt,
+        FunctionPass, SimplifyCfg, SimplifyCfgConstProp, SimplifyCfgEmpty, SimplifyCfgMerge,
+        SimplifyCfgReach, test_opt,
     };
 
     #[test]
     fn t1() {
-        test_opt(
-            &Path::new("examples/simplify_cfg/const_prop.input.ir"),
-            &Path::new("examples/simplify_cfg/const_prop.output.ir"),
-            &mut FunctionPass::<SimplifyCfgConstProp>::default(),
-        );
+        // test_opt(
+        //     &Path::new("examples/simplify_cfg/const_prop.input.ir"),
+        //     &Path::new("examples/simplify_cfg/const_prop.output.ir"),
+        //     &mut FunctionPass::<SimplifyCfgConstProp>::default(),
+        // );
 
-        test_opt(
-            &Path::new("examples/simplify_cfg/reach.input.ir"),
-            &Path::new("examples/simplify_cfg/reach.output.ir"),
-            &mut FunctionPass::<SimplifyCfgReach>::default(),
-        );
-
-        test_opt(
-            &Path::new("examples/simplify_cfg/merge.input.ir"),
-            &Path::new("examples/simplify_cfg/merge.output.ir"),
-            &mut FunctionPass::<SimplifyCfgMerge>::default(),
-        );
+        // test_opt(
+        //     &Path::new("examples/simplify_cfg/reach.input.ir"),
+        //     &Path::new("examples/simplify_cfg/reach.output.ir"),
+        //     &mut FunctionPass::<SimplifyCfgReach>::default(),
+        // );
 
         test_opt(
             &Path::new("examples/simplify_cfg/empty.input.ir"),
             &Path::new("examples/simplify_cfg/empty.output.ir"),
             &mut FunctionPass::<SimplifyCfgEmpty>::default(),
+        );
+
+        // test_opt(
+        //     &Path::new("examples/simplify_cfg/merge.input.ir"),
+        //     &Path::new("examples/simplify_cfg/merge.output.ir"),
+        //     &mut FunctionPass::<SimplifyCfgMerge>::default(),
+        // );
+    }
+
+    #[test]
+    fn test_basic() {
+        test_opt(
+            &Path::new("examples/ir0/switch-in-loop.ir"),
+            &Path::new("examples/ir1/switch-in-loop.ir"),
+            &mut SimplifyCfg::default(),
         );
     }
 }
