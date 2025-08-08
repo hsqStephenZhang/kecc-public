@@ -267,6 +267,50 @@ impl Instruction {
     pub fn has_no_side_effects(&self) -> bool {
         !matches!(self, Self::Store { .. } | Self::Call { .. })
     }
+
+    pub fn apply_args(&mut self, args: &[Operand]) {
+        match self {
+            Instruction::Value { value } => value.apply_arg(args),
+            Instruction::BinOp {
+                op,
+                lhs,
+                rhs,
+                dtype,
+            } => {
+                lhs.apply_arg(args);
+                rhs.apply_arg(args);
+            }
+            Instruction::UnaryOp { op, operand, dtype } => {
+                operand.apply_arg(args);
+            }
+            Instruction::Store { ptr, value } => {
+                ptr.apply_arg(args);
+                value.apply_arg(args);
+            }
+            Instruction::Load { ptr } => {
+                ptr.apply_arg(args);
+            }
+            Instruction::Call {
+                callee,
+                args: ops,
+                return_type,
+            } => {
+                callee.apply_arg(args);
+                ops.iter_mut().for_each(|op| op.apply_arg(args));
+            }
+            Instruction::TypeCast {
+                value,
+                target_dtype,
+            } => {
+                value.apply_arg(args);
+            }
+            Instruction::GetElementPtr { ptr, offset, dtype } => {
+                ptr.apply_arg(args);
+                offset.apply_arg(args);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Format `lang_c::ast::{Binary,Unary}Operations` into KECC-IR.
@@ -396,6 +440,26 @@ impl BlockExit {
                 }
             }
             Self::Return { .. } | Self::Unreachable => {}
+        }
+    }
+
+    pub fn set_op_bid(&mut self, new_bid: BlockId) {
+        let value = match self {
+            BlockExit::ConditionalJump {
+                condition,
+                arg_then,
+                arg_else,
+            } => condition.get_register_mut(),
+            BlockExit::Switch {
+                value,
+                default,
+                cases,
+            } => value.get_register_mut(),
+            BlockExit::Return { value } => value.get_register_mut(),
+            _ => None,
+        };
+        if let Some((rid, _)) = value {
+            rid.set_bid(new_bid);
         }
     }
 }
@@ -533,6 +597,22 @@ impl Operand {
             false
         }
     }
+
+    pub fn get_arg(&self) -> Option<(&BlockId, &usize)> {
+        if let Self::Register { rid, .. } = self
+            && let RegisterId::Arg { bid, aid } = rid
+        {
+            Some((bid, aid))
+        } else {
+            None
+        }
+    }
+
+    pub fn apply_arg(&mut self, args: &[Operand]) {
+        if let Some((_, idx)) = self.get_arg() {
+            *self = args[*idx].clone();
+        }
+    }
 }
 
 impl fmt::Display for Operand {
@@ -598,6 +678,14 @@ impl RegisterId {
             Self::Local { .. } => true,
             Self::Arg { bid, .. } => bid == &bid_init,
             _ => false,
+        }
+    }
+
+    pub fn set_bid(&mut self, new_bid: BlockId) {
+        match self {
+            RegisterId::Arg { bid, aid } => *bid = new_bid,
+            RegisterId::Temp { bid, iid } => *bid = new_bid,
+            _ => {}
         }
     }
 }
@@ -1083,6 +1171,10 @@ impl<T> Named<T> {
 
     pub fn inner(&self) -> &T {
         &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
     }
 }
 
