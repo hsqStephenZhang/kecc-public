@@ -367,7 +367,7 @@ impl GlobalMap {
     /// Create a bi-directional mapping between `var` and `bid`.
     fn insert(&mut self, var: String, bid: usize) -> Result<(), InterpreterError> {
         if self.var_to_bid.insert(var.clone(), bid).is_some() {
-            panic!("variable name should be unique in IR")
+            panic!("variable name should be unique in IR {}", var)
         }
         if self.bid_to_var.insert(bid, var).is_some() {
             panic!("`bid` is connected to only one `var`")
@@ -1143,6 +1143,28 @@ impl Memory {
 }
 
 #[derive(Debug, PartialEq)]
+struct HelperFunction {
+    args: Vec<Dtype>,
+    ret: Dtype,
+    f: fn(&[Value]) -> Value,
+}
+
+impl HelperFunction {
+    fn printf() -> Self {
+        fn printf_inner(values: &[Value]) -> Value {
+            println!("{:?}", values);
+            Value::int(0, 32, true)
+        }
+
+        Self {
+            args: vec![],
+            ret: Dtype::INT,
+            f: printf_inner,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 struct State<'i> {
     /// Maps each global variable to a pointer value.
     ///
@@ -1150,8 +1172,10 @@ struct State<'i> {
     pub global_map: GlobalMap,
     pub stack_frame: StackFrame<'i>,
     pub stack: Vec<StackFrame<'i>>,
+    pub current_helper: Option<(String, Vec<Value>)>,
     pub memory: Memory,
     pub ir: &'i TranslationUnit,
+    pub helpers: HashMap<String, HelperFunction>,
 }
 
 impl<'i> State<'i> {
@@ -1171,6 +1195,8 @@ impl<'i> State<'i> {
                 func_name: func_name.clone(),
             })?;
 
+        let mut helpers = HashMap::from([("printf".into(), HelperFunction::printf())]);
+
         // Create State
         let mut state = State {
             global_map: GlobalMap::default(),
@@ -1178,6 +1204,8 @@ impl<'i> State<'i> {
             stack: Vec::new(),
             memory: Default::default(),
             ir,
+            helpers,
+            current_helper: None,
         };
 
         state.alloc_global_variables()?;
@@ -1256,44 +1284,50 @@ impl<'i> State<'i> {
     }
 
     fn step(&mut self) -> Result<Option<Value>, InterpreterError> {
-        let block = self
-            .stack_frame
-            .func_def
-            .blocks
-            .get(&self.stack_frame.pc.bid)
-            .expect("block matched with `bid` must be exist");
-
-        // If it's time to execute an instruction, do so.
-        if let Some(instr) = block.instructions.get(self.stack_frame.pc.iid) {
-            self.interp_instruction(instr)?;
-            return Ok(None);
-        }
-
-        // Execute a block exit.
-        let Some(return_value) = self.interp_block_exit(&block.exit)? else {
-            return Ok(None);
-        };
-
-        // If it's returning from a function, pop the stack frame.
-
-        // Frees memory allocated in the callee
-        for (i, d) in self.stack_frame.func_def.allocations.iter().enumerate() {
-            let (bid, offset, dtype) = self
+        let return_value = if let Some((name, args)) = self.current_helper.take() {
+            let helper = self.helpers.get(&name).unwrap();
+            (helper.f)(&args)
+        } else {
+            let block = self
                 .stack_frame
-                .registers
-                .read(RegisterId::local(i))
-                .get_pointer()
-                .unwrap();
-            assert_eq!(d.deref(), dtype);
-            self.memory
-                .dealloc(bid.unwrap(), *offset, dtype, &self.ir.structs)?;
-        }
+                .func_def
+                .blocks
+                .get(&self.stack_frame.pc.bid)
+                .expect("block matched with `bid` must be exist");
 
-        // restore previous state
-        let Some(prev_stack_frame) = self.stack.pop() else {
-            return Ok(Some(return_value));
+            // If it's time to execute an instruction, do so.
+            if let Some(instr) = block.instructions.get(self.stack_frame.pc.iid) {
+                self.interp_instruction(instr)?;
+                return Ok(None);
+            }
+
+            // Execute a block exit.
+            let Some(return_value) = self.interp_block_exit(&block.exit)? else {
+                return Ok(None);
+            };
+
+            // If it's returning from a function, pop the stack frame.
+
+            // Frees memory allocated in the callee
+            for (i, d) in self.stack_frame.func_def.allocations.iter().enumerate() {
+                let (bid, offset, dtype) = self
+                    .stack_frame
+                    .registers
+                    .read(RegisterId::local(i))
+                    .get_pointer()
+                    .unwrap();
+                assert_eq!(d.deref(), dtype);
+                self.memory
+                    .dealloc(bid.unwrap(), *offset, dtype, &self.ir.structs)?;
+            }
+
+            // restore previous state
+            let Some(prev_stack_frame) = self.stack.pop() else {
+                return Ok(Some(return_value));
+            };
+            self.stack_frame = prev_stack_frame;
+            return_value
         };
-        self.stack_frame = prev_stack_frame;
 
         // create temporary register to write return value
         let register = RegisterId::temp(self.stack_frame.pc.bid, self.stack_frame.pc.iid);
@@ -1311,7 +1345,7 @@ impl<'i> State<'i> {
     }
 
     fn interp_args(
-        &self,
+        &mut self,
         signature: &FunctionSignature,
         args: &[Operand],
     ) -> Result<Vec<Value>, InterpreterError> {
@@ -1322,7 +1356,10 @@ impl<'i> State<'i> {
                 .zip(&signature.params)
                 .all(|(a, d)| a.dtype().set_const(false) == d.clone().set_const(false)))
         {
-            panic!("dtype of args and params must be compatible")
+            panic!(
+                "dtype of args and params must be compatible {:?} {:?}",
+                signature, args
+            )
         }
 
         args.iter()
@@ -1463,37 +1500,46 @@ impl<'i> State<'i> {
                 let (func_signature, func_def) = func
                     .get_function()
                     .expect("`func` must be function declaration");
-                let func_def =
-                    func_def
-                        .as_ref()
-                        .ok_or_else(|| InterpreterError::NoFunctionDefinition {
-                            func_name: callee_name.clone(),
-                        })?;
+                match func_def.as_ref() {
+                    Some(func_def) => {
+                        let block_init = func_def
+                            .blocks
+                            .get(&func_def.bid_init)
+                            .expect("init block must exists");
 
-                let block_init = func_def
-                    .blocks
-                    .get(&func_def.bid_init)
-                    .expect("init block must exists");
+                        if !(args.len() == block_init.phinodes.len()
+                            && args.iter().zip(&block_init.phinodes).all(|(a, d)| {
+                                a.dtype().set_const(false) == d.deref().clone().set_const(false)
+                            }))
+                        {
+                            panic!("dtype of args and phinodes of init block must be compatible");
+                        }
 
-                if !(args.len() == block_init.phinodes.len()
-                    && args.iter().zip(&block_init.phinodes).all(|(a, d)| {
-                        a.dtype().set_const(false) == d.deref().clone().set_const(false)
-                    }))
-                {
-                    panic!("dtype of args and phinodes of init block must be compatible");
+                        let args = self.interp_args(func_signature, args)?;
+
+                        let stack_frame = StackFrame::new(func_def.bid_init, callee_name, func_def);
+                        let prev_stack_frame = mem::replace(&mut self.stack_frame, stack_frame);
+                        self.stack.push(prev_stack_frame);
+
+                        // Initialize state with function obtained by callee and args
+                        self.write_args(func_def.bid_init, args)?;
+                        self.alloc_local_variables()?;
+
+                        return Ok(());
+                    }
+                    None => {
+                        if self.helpers.get(&callee_name).is_some() {
+                            let args = args
+                                .iter()
+                                .map(|a| self.interp_operand(a).unwrap())
+                                .collect::<Vec<_>>();
+                            self.current_helper = Some((callee_name, args));
+                            return Ok(());
+                        } else {
+                            todo!()
+                        }
+                    }
                 }
-
-                let args = self.interp_args(func_signature, args)?;
-
-                let stack_frame = StackFrame::new(func_def.bid_init, callee_name, func_def);
-                let prev_stack_frame = mem::replace(&mut self.stack_frame, stack_frame);
-                self.stack.push(prev_stack_frame);
-
-                // Initialize state with function obtained by callee and args
-                self.write_args(func_def.bid_init, args)?;
-                self.alloc_local_variables()?;
-
-                return Ok(());
             }
             Instruction::TypeCast {
                 value,
@@ -1538,20 +1584,24 @@ impl<'i> State<'i> {
         Ok(())
     }
 
-    fn interp_operand(&self, operand: &Operand) -> Result<Value, InterpreterError> {
+    fn interp_operand(&mut self, operand: &Operand) -> Result<Value, InterpreterError> {
         match operand {
             Operand::Constant(value) => Ok(self.interp_constant(value.clone())),
             Operand::Register { rid, .. } => Ok(self.stack_frame.registers.read(*rid).clone()),
         }
     }
 
-    fn interp_constant(&self, value: Constant) -> Value {
+    fn interp_constant(&mut self, value: Constant) -> Value {
         match value {
             Constant::GlobalVariable { name, dtype } => {
-                let bid = self
-                    .global_map
-                    .get_bid(&name)
-                    .expect("The name matching `bid` must exist.");
+                let bid = match self.global_map.get_bid(&name) {
+                    Some(bid) => bid,
+                    None => {
+                        let bid = self.memory.alloc(&dtype, &self.ir.structs).unwrap();
+                        self.global_map.insert(name, bid);
+                        bid
+                    }
+                };
 
                 // Generate appropriate pointer from `bid`
                 Value::Pointer {

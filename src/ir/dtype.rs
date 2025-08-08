@@ -36,6 +36,7 @@ struct BaseDtype {
     struct_type: Option<ast::StructType>,
     is_const: bool,
     is_typedef: bool,
+    is_extern: bool
 }
 
 /// TODO(document)
@@ -115,6 +116,51 @@ pub enum Dtype {
     },
 }
 
+pub mod builtin {
+    use crate::ir::Named;
+    use super::Dtype;
+
+    pub fn builtin_va_list() -> Dtype {
+        Dtype::Struct {
+            name: Some("__builtin_va_list".into()),
+            fields: Some(vec![
+                Named::new(
+                    Some("gp_offset".into()),
+                    Dtype::Int {
+                        width: 32,
+                        is_signed: false,
+                        is_const: false,
+                    },
+                ),
+                Named::new(
+                    Some("fp_offset".into()),
+                    Dtype::Int {
+                        width: 32,
+                        is_signed: false,
+                        is_const: false,
+                    },
+                ),
+                Named::new(
+                    Some("overflow_arg_area".into()),
+                    Dtype::Pointer {
+                        inner: Box::new(Dtype::Unit { is_const: false }),
+                        is_const: false,
+                    },
+                ),
+                Named::new(
+                    Some("reg_save_area".into()),
+                    Dtype::Pointer {
+                        inner: Box::new(Dtype::Unit { is_const: false }),
+                        is_const: false,
+                    },
+                ),
+            ]),
+            is_const: false,
+            size_align_offsets: None, // 也可以根据布局填写
+        }
+    }
+}
+
 impl BaseDtype {
     /// Apply `StorageClassSpecifier` to `BaseDtype`.
     ///
@@ -134,6 +180,10 @@ impl BaseDtype {
             ast::StorageClassSpecifier::Typedef => {
                 // duplicate `typedef` is allowed
                 self.is_typedef = true;
+                Ok(())
+            }
+            ast::StorageClassSpecifier::Extern => {
+                self.is_extern = true;
                 Ok(())
             }
             scs => Err(DtypeError::Misc {
@@ -746,7 +796,7 @@ impl Dtype {
         }
     }
 
-        #[inline]
+    #[inline]
     pub fn get_int_sign(&self) -> Option<bool> {
         if let Self::Int { is_signed, .. } = self {
             Some(*is_signed)

@@ -14,7 +14,7 @@ use core::ops::{Deref, DerefMut};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
-pub use dtype::{Dtype, DtypeError, HasDtype};
+pub use dtype::{Dtype, DtypeError, HasDtype, builtin};
 use hexf_parse::{parse_hexf32, parse_hexf64};
 pub use interp::{Value, interp};
 use itertools::Itertools;

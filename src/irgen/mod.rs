@@ -103,7 +103,7 @@ pub enum IrgenErrorMessage {
 }
 
 /// A C file going through IR generation.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Irgen {
     /// Declarations made in the C file (e.g, global variables and functions)
     decls: BTreeMap<String, ir::Declaration>,
@@ -114,6 +114,27 @@ pub struct Irgen {
     structs: HashMap<String, Option<ir::Dtype>>,
     /// Temporary counter for anonymous structs. One should not need to use this any more.
     struct_tempid_counter: usize,
+}
+
+impl Default for Irgen {
+    fn default() -> Self {
+        // add built in types
+        // let structs = HashMap::from([(
+        //     "__builtin_va_list".into(),
+        //     Some(ir::builtin::builtin_va_list()),
+        // )]);
+        let typedefs =
+            HashMap::from([("__builtin_va_list".into(), ir::builtin::builtin_va_list())]);
+
+        let mut this = Self {
+            decls: Default::default(),
+            typedefs,
+            structs: Default::default(),
+            struct_tempid_counter: Default::default(),
+        };
+
+        this
+    }
 }
 
 impl Translate<Parse> for Irgen {
@@ -2034,7 +2055,19 @@ impl IrgenFunc<'_> {
             }
             Expression::CompoundLiteral(..) => todo!(),
             Expression::Statement(..) => todo!(),
-            Expression::StringLiteral(..) => todo!(),
+            Expression::StringLiteral(node) => {
+                let content = node.node.join("");
+                let dtype = ir::Dtype::Array {
+                    inner: Box::new(ir::Dtype::CHAR),
+                    size: content.as_bytes().len() - 1,
+                };
+                let ptr = ir::Constant::GlobalVariable {
+                    name: "s".into(),
+                    dtype,
+                };
+                let value = load_direct(ir::Operand::constant(ptr), !no_deref, context);
+                (value, None)
+            }
             Expression::GenericSelection(..) => todo!(),
             Expression::OffsetOf(..) => todo!(),
             Expression::VaArg(..) => todo!(),

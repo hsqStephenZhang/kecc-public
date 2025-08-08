@@ -347,4 +347,24 @@ mod tests {
         println!("res: {:?}", res);
         Ok(())
     }
+
+    #[test]
+    fn test_others() {
+        let file = Path::new("examples/io/printf.c");
+        compile_ir_and_run_interpreter(&file).unwrap();
+    }
+
+    fn compile_ir_and_run_interpreter(c_file: &Path) -> io::Result<()> {
+        let mut stdout = stdout();
+
+        let parse = Parse {}.translate(&c_file).expect("parse failed");
+        let ir = Irgen::default().translate(&parse).expect("irgen failed");
+        writeln!(stdout, "ir gen of {:?} by us", c_file);
+        ir.write_line(0, &mut stdout)?;
+        stdout.flush()?;
+
+        let res = ir::interp(&ir, vec![]);
+        println!("res: {:?}", res);
+        Ok(())
+    }
 }
