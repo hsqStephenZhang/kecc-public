@@ -195,7 +195,8 @@ impl Block {
         // dbg!(new_bid, iid_shift, args);
         for (idx, insn) in self.instructions.iter_mut().enumerate() {
             let insn = insn.inner_mut();
-            insn.set_bid_and_iid(new_bid, iid_shift);
+            insn.visit_ops(|op| op.set_iid(|orig| *orig += iid_shift));
+            insn.visit_ops(|op| op.set_bid(new_bid));
         }
 
         if !self.phinodes.is_empty() {
@@ -333,61 +334,49 @@ impl Instruction {
         }
     }
 
-    pub fn set_bid_and_iid(&mut self, new_bid: BlockId, new_iid: usize) {
+    pub fn visit_ops(&mut self, mut visit: impl FnMut(&mut Operand)) {
         match self {
             Instruction::Value { value } => {
-                value.set_bid(new_bid);
-                value.apply_iid_shift(new_iid);
-            },
+                visit(value);
+            }
             Instruction::BinOp {
                 op,
                 lhs,
                 rhs,
                 dtype,
             } => {
-                lhs.set_bid(new_bid);
-                lhs.apply_iid_shift(new_iid);
-                rhs.set_bid(new_bid);
-                rhs.apply_iid_shift(new_iid);
+                visit(lhs);
+                visit(rhs);
             }
             Instruction::UnaryOp { op, operand, dtype } => {
-                operand.set_bid(new_bid);
-                operand.apply_iid_shift(new_iid);
+                visit(operand);
             }
             Instruction::Store { ptr, value } => {
-                ptr.set_bid(new_bid);
-                ptr.apply_iid_shift(new_iid);
-                value.set_bid(new_bid);
-                value.apply_iid_shift(new_iid);
+                visit(ptr);
+                visit(value);
             }
             Instruction::Load { ptr } => {
-                ptr.set_bid(new_bid);
-                ptr.apply_iid_shift(new_iid);
+                visit(ptr);
             }
             Instruction::Call {
                 callee,
                 args: ops,
                 return_type,
             } => {
-                callee.set_bid(new_bid);
-                callee.apply_iid_shift(new_iid);
+                visit(callee);
                 ops.iter_mut().for_each(|op| {
-                    op.set_bid(new_bid);
-                    op.apply_iid_shift(new_iid);
+                    visit(op);
                 });
             }
             Instruction::TypeCast {
                 value,
                 target_dtype,
             } => {
-                value.set_bid(new_bid);
-                value.apply_iid_shift(new_iid);
+                visit(value);
             }
             Instruction::GetElementPtr { ptr, offset, dtype } => {
-                ptr.set_bid(new_bid);
-                ptr.apply_iid_shift(new_iid);
-                offset.set_bid(new_bid);
-                offset.apply_iid_shift(new_iid);
+                visit(ptr);
+                visit(offset);
             }
             _ => {}
         }
@@ -554,6 +543,28 @@ impl BlockExit {
             None
         }
     }
+
+    pub fn op(&self) -> Option<&Operand> {
+        match self {
+            BlockExit::ConditionalJump {
+                condition: value, ..
+            }
+            | BlockExit::Switch { value, .. }
+            | BlockExit::Return { value } => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn visit_op(&mut self, mut visit: impl FnMut(&mut Operand)) {
+        match self {
+            BlockExit::ConditionalJump {
+                condition: value, ..
+            }
+            | BlockExit::Switch { value, .. } => visit(value),
+            BlockExit::Return { value } => visit(value),
+            _ => {}
+        }
+    }
 }
 
 impl fmt::Display for BlockExit {
@@ -680,6 +691,26 @@ impl Operand {
         }
     }
 
+    pub fn get_alloc(&self) -> Option<&usize> {
+        if let Self::Register { rid, .. } = self
+            && let RegisterId::Local { aid } = rid
+        {
+            Some(aid)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_alloc_mut(&mut self) -> Option<&mut usize> {
+        if let Self::Register { rid, .. } = self
+            && let RegisterId::Local { aid } = rid
+        {
+            Some(aid)
+        } else {
+            None
+        }
+    }
+
     pub fn is_arg(&self) -> bool {
         if let Self::Register { rid, .. } = self
             && let RegisterId::Arg { .. } = rid
@@ -700,11 +731,43 @@ impl Operand {
         }
     }
 
+    pub fn get_arg_mut(&mut self) -> Option<(&mut BlockId, &mut usize)> {
+        if let Self::Register { rid, .. } = self
+            && let RegisterId::Arg { bid, aid } = rid
+        {
+            Some((bid, aid))
+        } else {
+            None
+        }
+    }
+
     pub fn get_bid_mut(&mut self) -> Option<&mut BlockId> {
         if let Self::Register { rid, .. } = self {
             match rid {
                 RegisterId::Local { aid } => None,
                 RegisterId::Arg { bid, .. } | RegisterId::Temp { bid, .. } => Some(bid),
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_temp(&self) -> Option<(&BlockId, &usize)> {
+        if let Self::Register { rid, .. } = self {
+            match rid {
+                RegisterId::Temp { bid, iid } => Some((bid, iid)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_temp_mut(&mut self) -> Option<(&mut BlockId, &mut usize)> {
+        if let Self::Register { rid, .. } = self {
+            match rid {
+                RegisterId::Temp { bid, iid } => Some((bid, iid)),
+                _ => None,
             }
         } else {
             None
@@ -734,9 +797,17 @@ impl Operand {
         }
     }
 
-    pub fn apply_iid_shift(&mut self, iid_shift: usize) {
+    pub fn set_iid(&mut self, f: impl Fn(&mut usize)) {
         if let Some(iid) = self.get_iid_mut() {
-            *iid += iid_shift;
+            f(iid);
+        }
+    }
+
+    pub fn set_arg(&mut self, f: impl Fn(&mut BlockId, &mut usize)) {
+        if let Self::Register { rid, .. } = self
+            && let RegisterId::Arg { bid, aid } = rid
+        {
+            f(bid, aid)
         }
     }
 }
