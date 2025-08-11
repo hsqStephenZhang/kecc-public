@@ -16,52 +16,6 @@ pub type SimplifyCfg = FunctionPass<
     )>,
 >;
 
-fn build_cfg(def: &FunctionDefinition) -> (Graph<BlockId, ()>, HashMap<BlockId, NodeIndex>) {
-    let mut graph = Graph::new();
-    let mut bid_to_idx = HashMap::new();
-    for (&bid, _) in &def.blocks {
-        let idx = graph.add_node(bid);
-        let _ = bid_to_idx.insert(bid, idx);
-    }
-
-    for (bid, block) in &def.blocks {
-        let idx_from = bid_to_idx.get(bid).unwrap();
-        let exit = &block.exit;
-        match exit {
-            BlockExit::Jump { arg } => {
-                let idx_to = bid_to_idx.get(&arg.bid).unwrap();
-                let _ = graph.add_edge(*idx_from, *idx_to, ());
-            }
-            BlockExit::ConditionalJump {
-                condition,
-                arg_then,
-                arg_else,
-            } => {
-                let idx_to1 = bid_to_idx.get(&arg_then.bid).unwrap();
-                let idx_to2 = bid_to_idx.get(&arg_else.bid).unwrap();
-                let _ = graph.add_edge(*idx_from, *idx_to1, ());
-                let _ = graph.add_edge(*idx_from, *idx_to2, ());
-            }
-            BlockExit::Switch {
-                value,
-                default,
-                cases,
-            } => {
-                let idx_to_default = bid_to_idx.get(&default.bid).unwrap();
-                let _ = graph.add_edge(*idx_from, *idx_to_default, ());
-
-                for (_, arg) in cases {
-                    let idx_to = bid_to_idx.get(&arg.bid).unwrap();
-                    let _ = graph.add_edge(*idx_from, *idx_to, ());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    (graph, bid_to_idx)
-}
-
 /// Simplifies block exits by propagating constants.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct SimplifyCfgConstProp {}

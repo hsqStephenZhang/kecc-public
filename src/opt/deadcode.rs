@@ -179,10 +179,13 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
 
         // topographical traverse
         // make sure that data dependency across BB is also counted
-        let mut visited = HashSet::from([code.bid_init]);
+        let mut visited = HashSet::new();
         let mut queue = VecDeque::from([code.bid_init]);
         while !queue.is_empty() {
             let bid = queue.pop_front().unwrap();
+            if !visited.insert(bid) {
+                continue;
+            }
 
             let mut block = code.blocks.get_mut(&bid).unwrap();
             let mut necess_insns = necessary_insns.get(&bid).unwrap();
@@ -224,10 +227,7 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
             block.exit.walk_jump_args(|arg| nexts.push(arg.bid));
             nexts.dedup();
             for next in nexts {
-                if !visited.contains(&next) {
-                    queue.push_back(next);
-                    let _ = visited.insert(next);
-                }
+                queue.push_back(next);
             }
         }
 
