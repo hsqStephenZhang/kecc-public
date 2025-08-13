@@ -432,6 +432,49 @@ impl Instruction {
         }
     }
 
+    pub fn visit_values(&self, mut visit: impl FnMut(&Operand)) {
+        match self {
+            Instruction::Value { value } => {
+                visit(value);
+            }
+            Instruction::BinOp {
+                op,
+                lhs,
+                rhs,
+                dtype,
+            } => {
+                visit(lhs);
+                visit(rhs);
+            }
+            Instruction::UnaryOp { op, operand, dtype } => {
+                visit(operand);
+            }
+            Instruction::Store { ptr, value } => {
+                visit(value);
+            }
+            Instruction::Call {
+                callee,
+                args: ops,
+                return_type,
+            } => {
+                visit(callee);
+                ops.iter().for_each(|op| {
+                    visit(op);
+                });
+            }
+            Instruction::TypeCast {
+                value,
+                target_dtype,
+            } => {
+                visit(value);
+            }
+            Instruction::GetElementPtr { ptr, offset, dtype } => {
+                visit(offset);
+            }
+            _ => {}
+        }
+    }
+
     pub fn visit_ops(&self, mut visit: impl FnMut(&Operand)) {
         match self {
             Instruction::Value { value } => {
@@ -611,7 +654,6 @@ impl BlockExit {
         }
     }
 
-
     pub fn walk_jump_args<F>(&self, mut f: F)
     where
         F: FnMut(&JumpArg),
@@ -751,6 +793,10 @@ pub enum Operand {
 }
 
 impl Operand {
+    pub fn undef(dtype: Dtype) -> Self {
+        Self::Constant(Constant::Undef { dtype })
+    }
+
     pub fn constant(value: Constant) -> Self {
         Self::Constant(value)
     }

@@ -21,7 +21,7 @@ pub(crate) fn build_cfg(
     for (&bid, _) in &def.blocks {
         let idx = graph.add_node(bid);
         let _ = bid_to_idx.insert(bid, idx);
-    } 
+    }
 
     for (bid, block) in &def.blocks {
         let idx_from = bid_to_idx.get(bid).unwrap();
@@ -43,7 +43,7 @@ pub(crate) fn build_cfg(
                         dbg!(exit);
                         dbg!(def.blocks.keys());
                         panic!();
-                    },
+                    }
                 };
                 let idx_to2 = bid_to_idx.get(&arg_else.bid).unwrap();
                 let _ = graph.add_edge(*idx_from, *idx_to1, ());
@@ -97,8 +97,24 @@ pub(crate) fn successors(
 pub(crate) fn dominance_frontiers(
     cfg: &Graph<BlockId, ()>,
     entry_idx: NodeIndex,
-) -> HashMap<BlockId, HashSet<BlockId>> {
+) -> (
+    HashMap<BlockId, HashSet<BlockId>>,
+    HashMap<BlockId, Vec<BlockId>>,
+    Dominators<NodeIndex>,
+) {
     let dom: Dominators<NodeIndex> = simple_fast(cfg, entry_idx);
+
+    let mut dom_tree_children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for node_idx in cfg.node_indices() {
+        if let Some(idom_idx) = dom.immediate_dominator(node_idx) {
+            if idom_idx != node_idx {
+                dom_tree_children
+                    .entry(cfg[idom_idx])
+                    .or_default()
+                    .push(cfg[node_idx]);
+            }
+        }
+    }
 
     let mut df: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
 
@@ -119,20 +135,73 @@ pub(crate) fn dominance_frontiers(
         }
     }
 
-    df.into_iter()
+    let df = df
+        .into_iter()
         .map(|(k, v)| {
             (
                 cfg[k],
                 v.into_iter().map(|v| cfg[v]).collect::<HashSet<_>>(),
             )
         })
-        .collect::<HashMap<_, _>>()
+        .collect::<HashMap<_, _>>();
+    (df, dom_tree_children, dom)
+}
+
+pub(crate) fn dominance_tree(
+    cfg: &Graph<BlockId, ()>,
+    entry_idx: NodeIndex,
+) -> HashMap<BlockId, Vec<BlockId>> {
+    todo!()
+}
+
+/// insert at: DF(S), DF(DF(S)), DF(DF(DF(S))
+/// DF: dominance frontier
+pub(crate) fn phi_insert_at(
+    mut defs: HashSet<BlockId>,
+    df: &HashMap<BlockId, HashSet<BlockId>>,
+) -> HashSet<BlockId> {
+    let mut insert_at: HashSet<BlockId> = HashSet::new();
+    loop {
+        let prev = insert_at.clone();
+        for def in &defs {
+            if let Some(frontier) = df.get(def) {
+                insert_at.extend(frontier);
+            }
+        }
+        // iterate until fixedpoint
+        if prev == insert_at {
+            break;
+        }
+        defs = insert_at.clone();
+    }
+    insert_at
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    ///                    |                         
+    ///                 +--C--+                      
+    /// +--------------->     |                      
+    /// |               |     |                      
+    /// |               +--+--+                      
+    /// |        +---------+---------+               
+    /// |     +--A--+             +--B--+      +--E--+
+    /// |     |     |             |     +------>     |
+    /// |     +--+--+             +--+--+      +-----+
+    /// |        |                   |               
+    /// |        |                   |               
+    /// |     +--F--+                |               
+    /// |     |     |                |               
+    /// |     |     |                |               
+    /// |     +--+--+                |               
+    /// |        |                   |               
+    /// |        +---------+---------+               
+    /// |                  |                         
+    /// |               +--D--+                      
+    /// +---------------+     |                      
+    ///                 +-----+                                
     #[test]
     fn test_df() {
         let mut cfg: Graph<BlockId, ()> = Graph::new();
@@ -152,9 +221,33 @@ mod tests {
         let _ = cfg.add_edge(b, e, ());
         let _ = cfg.add_edge(d, c, ());
 
-        let dom = simple_fast(&cfg, c);
-        let df = dominance_frontiers(&cfg, c);
+        // let dom = simple_fast(&cfg, c);
+        let (df, dom_tree, dom) = dominance_frontiers(&cfg, c);
         assert_eq!(*df.get(&BlockId(3)).unwrap(), HashSet::from([BlockId(3)]));
         assert_eq!(*df.get(&BlockId(4)).unwrap(), HashSet::from([BlockId(3)]));
+
+        // def at 1,2
+        // insert at 3,4
+        let mut defs = HashSet::from([BlockId(1), BlockId(2)]);
+        let insert_at = phi_insert_at(defs, &df);
+        assert_eq!(insert_at, HashSet::from([BlockId(3), BlockId(4)]));
+
+        // def at 1
+        // insert at 3,4
+        let mut defs = HashSet::from([BlockId(1)]);
+        let insert_at = phi_insert_at(defs, &df);
+        assert_eq!(insert_at, HashSet::from([BlockId(3), BlockId(4)]));
+
+        // def at 4
+        // insert at 3
+        let mut defs = HashSet::from([BlockId(4)]);
+        let insert_at = phi_insert_at(defs, &df);
+        assert_eq!(insert_at, HashSet::from([BlockId(3)]));
+
+        // def at 3
+        // insert at 3
+        let mut defs = HashSet::from([BlockId(3)]);
+        let insert_at = phi_insert_at(defs, &df);
+        assert_eq!(insert_at, HashSet::from([BlockId(3)]));
     }
 }
