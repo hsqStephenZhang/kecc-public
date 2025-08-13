@@ -3,9 +3,11 @@
 //! You can freely add utilities commonly used in the implementation of multiple optimizations here.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::DefaultHasher;
 use std::ops::Deref;
 
 use itertools::izip;
+use petgraph::algo::dominators::{Dominators, simple_fast};
 use petgraph::prelude::*;
 use serde::de;
 
@@ -19,7 +21,7 @@ pub(crate) fn build_cfg(
     for (&bid, _) in &def.blocks {
         let idx = graph.add_node(bid);
         let _ = bid_to_idx.insert(bid, idx);
-    }
+    } 
 
     for (bid, block) in &def.blocks {
         let idx_from = bid_to_idx.get(bid).unwrap();
@@ -34,7 +36,15 @@ pub(crate) fn build_cfg(
                 arg_then,
                 arg_else,
             } => {
-                let idx_to1 = bid_to_idx.get(&arg_then.bid).unwrap();
+                let idx_to1 = match bid_to_idx.get(&arg_then.bid) {
+                    Some(v) => v,
+                    None => {
+                        dbg!(bid_to_idx);
+                        dbg!(exit);
+                        dbg!(def.blocks.keys());
+                        panic!();
+                    },
+                };
                 let idx_to2 = bid_to_idx.get(&arg_else.bid).unwrap();
                 let _ = graph.add_edge(*idx_from, *idx_to1, ());
                 let _ = graph.add_edge(*idx_from, *idx_to2, ());
@@ -82,4 +92,69 @@ pub(crate) fn successors(
         .into_iter()
         .map(|edge| cfg[edge.target()])
         .collect::<Vec<_>>()
+}
+
+pub(crate) fn dominance_frontiers(
+    cfg: &Graph<BlockId, ()>,
+    entry_idx: NodeIndex,
+) -> HashMap<BlockId, HashSet<BlockId>> {
+    let dom: Dominators<NodeIndex> = simple_fast(cfg, entry_idx);
+
+    let mut df: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
+
+    for edge in cfg.edge_references() {
+        let a = edge.source();
+        let b = edge.target();
+        let mut x = a;
+        while let Some(mut iter) = dom.strict_dominators(b)
+            && !iter.any(|node| node == x)
+        {
+            let mut entry = df.entry(x).or_default();
+            let _ = entry.insert(b);
+
+            x = match dom.immediate_dominator(x) {
+                Some(x) => x,
+                None => break,
+            }
+        }
+    }
+
+    df.into_iter()
+        .map(|(k, v)| {
+            (
+                cfg[k],
+                v.into_iter().map(|v| cfg[v]).collect::<HashSet<_>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_df() {
+        let mut cfg: Graph<BlockId, ()> = Graph::new();
+        let a = cfg.add_node(BlockId(1));
+        let b = cfg.add_node(BlockId(2));
+        let c = cfg.add_node(BlockId(3));
+        let d = cfg.add_node(BlockId(4));
+        let e = cfg.add_node(BlockId(5));
+        let f = cfg.add_node(BlockId(6));
+
+        // c is the root
+        let _ = cfg.add_edge(c, a, ());
+        let _ = cfg.add_edge(c, b, ());
+        let _ = cfg.add_edge(a, f, ());
+        let _ = cfg.add_edge(f, d, ());
+        let _ = cfg.add_edge(b, d, ());
+        let _ = cfg.add_edge(b, e, ());
+        let _ = cfg.add_edge(d, c, ());
+
+        let dom = simple_fast(&cfg, c);
+        let df = dominance_frontiers(&cfg, c);
+        assert_eq!(*df.get(&BlockId(3)).unwrap(), HashSet::from([BlockId(3)]));
+        assert_eq!(*df.get(&BlockId(4)).unwrap(), HashSet::from([BlockId(3)]));
+    }
 }

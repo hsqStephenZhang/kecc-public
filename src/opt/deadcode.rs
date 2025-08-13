@@ -90,7 +90,7 @@ impl DeadcodeInner {
             visited.get_mut(&bid).unwrap()[idx] = true;
             let block = code.blocks.get_mut(&bid).unwrap();
 
-            block.instructions[idx].inner_mut().visit_ops(|value| {
+            block.instructions[idx].inner_mut().visit_ops_mut(|value| {
                 let _ = try_enqueue(&mut queue, &mut visited, value);
             });
         }
@@ -199,15 +199,15 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
             for (idx, inst_idx) in necess_insns.iter().enumerate() {
                 let offset = *inst_idx - idx;
                 let inst = block.instructions[*inst_idx].inner_mut();
-                inst.visit_ops(|op| {
+                inst.visit_ops_mut(|op| {
                     update_op_if_is_temp(op, &old_inst_to_new_all_blocks);
                 });
-                inst.visit_ops(|op| {
+                inst.visit_ops_mut(|op| {
                     if let Some(aid) = op.get_alloc_mut() {
                         *aid = *old_allocs_to_new.get(aid).unwrap();
                     }
                 });
-                inst.visit_ops(|op| {
+                inst.visit_ops_mut(|op| {
                     if op.dtype().is_unit() {
                         *op = Operand::constant(Constant::Unit);
                     }
@@ -270,7 +270,7 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
             };
             for insn in &mut block.instructions {
                 let insn = insn.inner_mut();
-                insn.visit_ops(&mut visitor);
+                insn.visit_ops_mut(&mut visitor);
             }
             block.exit.visit_op(&mut visitor);
             block.exit.walk_jump_args(|arg| {
@@ -344,7 +344,7 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
         for (bid, block) in code.blocks.iter_mut() {
             for insn in &mut block.instructions {
                 let insn = insn.inner_mut();
-                insn.visit_ops(|op| {
+                insn.visit_ops_mut(|op| {
                     if let Some((bid, aid)) = op.get_arg_mut() {
                         *aid = useful_phinodes_map[bid][aid];
                     }

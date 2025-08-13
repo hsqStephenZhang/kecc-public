@@ -11,7 +11,7 @@ mod write_ir;
 use core::convert::TryFrom;
 use core::fmt;
 use core::ops::{Deref, DerefMut};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 pub use dtype::{Dtype, DtypeError, HasDtype, builtin};
@@ -174,6 +174,56 @@ pub struct FunctionDefinition {
     pub bid_init: BlockId,
 }
 
+impl FunctionDefinition {
+    /// post order traversal
+    pub fn post_order(&self) -> Vec<BlockId> {
+        fn traverse_inner(
+            this: BlockId,
+            blocks: &BTreeMap<BlockId, Block>,
+            visited: &mut HashSet<BlockId>,
+            collector: &mut Vec<BlockId>,
+        ) {
+            if !visited.insert(this) {
+                return;
+            }
+            match &blocks.get(&this).unwrap().exit {
+                BlockExit::Jump { arg } => traverse_inner(arg.bid, blocks, visited, collector),
+                BlockExit::ConditionalJump {
+                    condition,
+                    arg_then,
+                    arg_else,
+                } => {
+                    traverse_inner(arg_then.bid, blocks, visited, collector);
+                    traverse_inner(arg_else.bid, blocks, visited, collector);
+                }
+                BlockExit::Switch {
+                    value,
+                    default,
+                    cases,
+                } => {
+                    traverse_inner(default.bid, blocks, visited, collector);
+                    for (_, arg) in cases {
+                        traverse_inner(arg.bid, blocks, visited, collector);
+                    }
+                }
+                _ => {}
+            }
+            collector.push(this);
+        }
+
+        let mut res = Vec::with_capacity(self.blocks.len());
+        let mut visited = HashSet::new();
+        traverse_inner(self.bid_init, &self.blocks, &mut visited, &mut res);
+        res
+    }
+
+    pub fn reverse_post_order(&self) -> Vec<BlockId> {
+        let mut res = self.post_order();
+        res.reverse();
+        res
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockId(pub usize);
 
@@ -195,8 +245,8 @@ impl Block {
         // dbg!(new_bid, iid_shift, args);
         for (idx, insn) in self.instructions.iter_mut().enumerate() {
             let insn = insn.inner_mut();
-            insn.visit_ops(|op| op.set_iid(|orig| *orig += iid_shift));
-            insn.visit_ops(|op| op.set_bid(new_bid));
+            insn.visit_ops_mut(|op| op.set_iid(|orig| *orig += iid_shift));
+            insn.visit_ops_mut(|op| op.set_bid(new_bid));
         }
 
         if !self.phinodes.is_empty() {
@@ -334,7 +384,7 @@ impl Instruction {
         }
     }
 
-    pub fn visit_ops(&mut self, mut visit: impl FnMut(&mut Operand)) {
+    pub fn visit_ops_mut(&mut self, mut visit: impl FnMut(&mut Operand)) {
         match self {
             Instruction::Value { value } => {
                 visit(value);
@@ -365,6 +415,54 @@ impl Instruction {
             } => {
                 visit(callee);
                 ops.iter_mut().for_each(|op| {
+                    visit(op);
+                });
+            }
+            Instruction::TypeCast {
+                value,
+                target_dtype,
+            } => {
+                visit(value);
+            }
+            Instruction::GetElementPtr { ptr, offset, dtype } => {
+                visit(ptr);
+                visit(offset);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn visit_ops(&self, mut visit: impl FnMut(&Operand)) {
+        match self {
+            Instruction::Value { value } => {
+                visit(value);
+            }
+            Instruction::BinOp {
+                op,
+                lhs,
+                rhs,
+                dtype,
+            } => {
+                visit(lhs);
+                visit(rhs);
+            }
+            Instruction::UnaryOp { op, operand, dtype } => {
+                visit(operand);
+            }
+            Instruction::Store { ptr, value } => {
+                visit(ptr);
+                visit(value);
+            }
+            Instruction::Load { ptr } => {
+                visit(ptr);
+            }
+            Instruction::Call {
+                callee,
+                args: ops,
+                return_type,
+            } => {
+                visit(callee);
+                ops.iter().for_each(|op| {
                     visit(op);
                 });
             }
@@ -944,7 +1042,7 @@ impl Hash for RegisterId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Constant {
     Undef {
         dtype: Dtype,
@@ -1337,7 +1435,7 @@ impl HasDtype for Constant {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Named<T> {
     name: Option<String>,
     inner: T,

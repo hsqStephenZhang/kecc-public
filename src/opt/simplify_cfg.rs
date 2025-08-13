@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 
 use itertools::izip;
@@ -91,53 +91,23 @@ impl Optimize<FunctionDefinition> for SimplifyCfgReach {
     fn optimize(&mut self, code: &mut FunctionDefinition) -> bool {
         let mut changed = false;
         let mut reachable = HashSet::new();
-        let mut queue = vec![code.bid_init];
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::from([code.bid_init]);
         while !queue.is_empty() {
-            let cur = queue.pop().unwrap();
+            let cur = queue.pop_front().unwrap();
+            if !visited.insert(cur) {
+                continue;
+            }
             let _ = reachable.insert(cur);
             let block = code.blocks.get(&cur).unwrap();
-            match &block.exit {
-                BlockExit::Jump { arg } => {
-                    if !reachable.contains(&arg.bid) {
-                        queue.push(arg.bid);
-                    }
-                }
-                BlockExit::ConditionalJump {
-                    arg_then, arg_else, ..
-                } => {
-                    if !reachable.contains(&arg_then.bid) {
-                        queue.push(arg_then.bid);
-                    }
-                    if !reachable.contains(&arg_else.bid) {
-                        queue.push(arg_else.bid);
-                    }
-                }
-                BlockExit::Switch {
-                    value,
-                    default,
-                    cases,
-                } => {
-                    if !reachable.contains(&default.bid) {
-                        queue.push(default.bid);
-                    }
-                    for case in cases {
-                        if !reachable.contains(&case.1.bid) {
-                            queue.push(case.1.bid);
-                        }
-                    }
-                }
-                _ => {}
-            }
+            block.exit.walk_jump_args(|arg| {
+                queue.push_back(arg.bid);
+            });
         }
 
         if reachable.len() != code.blocks.len() {
             changed = true;
-            let all = code.blocks.keys().cloned().collect::<Vec<_>>();
-            for bid in all {
-                if !reachable.contains(&bid) {
-                    let _ = code.blocks.remove(&bid);
-                }
-            }
+            code.blocks.retain(|bid, _| reachable.contains(bid));
         }
 
         changed
