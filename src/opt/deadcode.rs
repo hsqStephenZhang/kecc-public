@@ -19,7 +19,7 @@ impl DeadcodeInner {
         code: &mut Block,
         init_sets: &mut HashMap<BlockId, HashSet<usize>>,
     ) {
-        let try_collect =
+        let collect =
             |init_sets: &mut HashMap<BlockId, HashSet<usize>>, bid: BlockId, iid: usize| {
                 let _ = init_sets
                     .entry(bid)
@@ -31,7 +31,7 @@ impl DeadcodeInner {
                 if let Some((reg, _)) = op.get_register()
                     && let RegisterId::Temp { iid, bid } = reg
                 {
-                    try_collect(init_sets, *bid, *iid);
+                    collect(init_sets, *bid, *iid);
                 }
             }
         });
@@ -39,20 +39,20 @@ impl DeadcodeInner {
             && let Some((reg, _)) = op.get_register()
             && let RegisterId::Temp { iid, bid } = reg
         {
-            try_collect(init_sets, *bid, *iid);
+            collect(init_sets, *bid, *iid);
         }
         for (idx, insn) in code.instructions.iter().enumerate() {
             match insn.inner() {
                 Instruction::Store { .. }
                 | Instruction::Load { .. }
                 | Instruction::Call { .. }
-                | Instruction::GetElementPtr { .. } => try_collect(init_sets, bid, idx),
+                | Instruction::GetElementPtr { .. } => collect(init_sets, bid, idx),
                 _ => {}
             }
         }
     }
 
-    fn iterate_to_fixpoint(
+    fn propagate_necessary_instructions(
         code: &mut FunctionDefinition,
         init_sets: &HashMap<BlockId, HashSet<usize>>,
     ) -> HashMap<BlockId, Vec<usize>> {
@@ -120,9 +120,11 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
             let _ = Self::collect_necessary_instructions(bid, block, &mut init_sets);
         }
 
-        let necessary_insns = Self::iterate_to_fixpoint(code, &init_sets);
+        // necessary instructions for each block
+        let necessary_insns = Self::propagate_necessary_instructions(code, &init_sets);
         // dbg!(&necessary_insns);
 
+        // necessary allocs for the function
         for (bid, necess_insns) in &necessary_insns {
             let block = code.blocks.get(bid).unwrap();
             for inst in necess_insns {
@@ -140,7 +142,7 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
         }
 
         // fix allocations
-        // dbg!(code.allocations.len());
+        // create a map from old to new alloc
         let mut old_allocs_to_new = HashMap::new();
         if used_allocs.len() != code.allocations.len() {
             changed = true;
@@ -157,7 +159,6 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
                 .map(|x| (x, x))
                 .collect::<HashMap<_, _>>();
         }
-        // dbg!(&old_allocs_to_new);
 
         // bid -> (old inst idx -> new inst idx)
         let mut old_inst_to_new_all_blocks = HashMap::new();
@@ -217,14 +218,14 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
             block.exit.visit_op(|op| {
                 update_op_if_is_temp(op, &old_inst_to_new_all_blocks);
             });
-            block.exit.walk_jump_args(|arg| {
+            block.exit.walk_jump_args_mut(|arg| {
                 for op in &mut arg.args {
                     update_op_if_is_temp(op, &old_inst_to_new_all_blocks);
                 }
             });
 
             let mut nexts = vec![];
-            block.exit.walk_jump_args(|arg| nexts.push(arg.bid));
+            block.exit.walk_jump_args_mut(|arg| nexts.push(arg.bid));
             nexts.dedup();
             for next in nexts {
                 queue.push_back(next);
@@ -273,7 +274,7 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
                 insn.visit_ops_mut(&mut visitor);
             }
             block.exit.visit_op(&mut visitor);
-            block.exit.walk_jump_args(|arg| {
+            block.exit.walk_jump_args_mut(|arg| {
                 for op in &mut arg.args {
                     visitor(op);
                 }
@@ -281,7 +282,7 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
         }
 
         // 2. from old phinode index to new index map
-        let mut useful_phinodes_map: HashMap<BlockId, HashMap<usize, usize>> = useful_phinodes
+        let mut useful_phinodes_map = useful_phinodes
             .iter()
             .map(|(k, v)| {
                 let value = v
@@ -293,11 +294,9 @@ impl Optimize<FunctionDefinition> for DeadcodeInner {
             })
             .collect::<HashMap<_, _>>();
 
-        // dbg!(&useful_phinodes_map);
-
         // 3. fix jump args that use the useless phinodes
         for (bid, block) in code.blocks.iter_mut() {
-            block.exit.walk_jump_args(|arg| {
+            block.exit.walk_jump_args_mut(|arg| {
                 let jump_target_phinodes = useful_phinodes_map.get(&arg.bid).unwrap();
                 let used = arg
                     .args

@@ -589,9 +589,32 @@ pub enum BlockExit {
 }
 
 impl BlockExit {
-    pub fn walk_jump_args<F>(&mut self, mut f: F)
+    pub fn walk_jump_args_mut<F>(&mut self, mut f: F)
     where
         F: FnMut(&mut JumpArg),
+    {
+        match self {
+            Self::Jump { arg } => f(arg),
+            Self::ConditionalJump {
+                arg_then, arg_else, ..
+            } => {
+                f(arg_then);
+                f(arg_else);
+            }
+            Self::Switch { default, cases, .. } => {
+                f(default);
+                for (_, arg) in cases {
+                    f(arg);
+                }
+            }
+            Self::Return { .. } | Self::Unreachable => {}
+        }
+    }
+
+
+    pub fn walk_jump_args<F>(&self, mut f: F)
+    where
+        F: FnMut(&JumpArg),
     {
         match self {
             Self::Jump { arg } => f(arg),
