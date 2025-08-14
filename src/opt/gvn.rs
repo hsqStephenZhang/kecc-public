@@ -1,5 +1,5 @@
 use core::ops::Deref;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use itertools::{Either, izip};
 use lang_c::ast;
@@ -24,9 +24,11 @@ enum InstKind {
     GetElementPtr,
 }
 
-impl From<&Instruction> for InstKind {
-    fn from(value: &Instruction) -> Self {
-        match value {
+impl TryFrom<&Instruction> for InstKind {
+    type Error = ();
+
+    fn try_from(value: &Instruction) -> Result<Self, Self::Error> {
+        let res = match value {
             Instruction::Nop => Self::Nop,
             Instruction::Value { value } => Self::Value,
             Instruction::BinOp {
@@ -48,7 +50,8 @@ impl From<&Instruction> for InstKind {
                 target_dtype,
             } => Self::TypeCast,
             Instruction::GetElementPtr { ptr, offset, dtype } => Self::GetElementPtr,
-        }
+        };
+        Ok(res)
     }
 }
 
@@ -58,51 +61,65 @@ struct Expr {
     kind: InstKind,
     /// numbers of the operands if it's not a const
     /// we use btree-set to make sure that they're ordered
-    numbers: BTreeSet<usize>,
-    consts: BTreeSet<Constant>,
+    ops: Vec<Either<usize, Constant>>,
+    // usage of alloc and its version
+    locals: BTreeMap<usize, usize>,
     dtype: Dtype,
 }
 
-impl Expr {
-    fn new(insn: &Instruction, tbl: &ValueTable) -> Expr {
-        let mut numbers = BTreeSet::new();
-        let mut consts = BTreeSet::new();
-        insn.visit_ops(|op| match op {
-            Operand::Constant(c) => {
-                let _ = consts.insert(c.clone());
-            }
-            Operand::Register { rid, dtype } => {
-                let num = match tbl.reg.get(rid) {
-                    Some(v) => v,
-                    None => {
-                        dbg!(tbl);
-                        dbg!(insn);
-                        panic!("{}", rid);
-                    }
-                };
-                let _ = numbers.insert(*num);
-            }
-        });
-        let dtype = insn.dtype();
-        Self {
-            kind: insn.into(),
-            numbers,
-            consts,
-            dtype,
-        }
-    }
+fn is_commutative(op: &ast::BinaryOperator) -> bool {
+    use ast::BinaryOperator::*;
+    matches!(
+        op,
+        Plus | Multiply | BitwiseAnd | BitwiseOr | BitwiseXor | Equals | NotEquals
+    )
 }
 
+impl Expr {
+    fn new(insn: &Instruction, tbl: &ValueTable, memver: &HashMap<usize, usize>) -> Option<Expr> {
+        let mut ops = Vec::new();
+        let mut locals = BTreeMap::new();
+        let dtype = insn.dtype();
+        let kind = insn.try_into().ok()?;
+
+        insn.visit_ops(|op| match op {
+            Operand::Constant(c) => {
+                let _ = ops.push(Either::Right(c.clone()));
+            }
+            Operand::Register { rid, dtype } => {
+                if let RegisterId::Local { aid } = rid {
+                    let ver = memver.get(aid).cloned().unwrap_or_default();
+                    let _ = locals.insert(*aid, ver);
+                } else if let Some(num) = tbl.reg.get(rid) {
+                    let _ = ops.push(Either::Left(*num));
+                } else {
+                    // TODO: how to handle this?
+                    return;
+                }
+            }
+        });
+        if let InstKind::Bin(op) = &kind {
+            if is_commutative(op) {
+                ops.sort_unstable();
+            }
+        }
+
+        Some(Self {
+            kind,
+            ops,
+            locals,
+            dtype,
+        })
+    }
+}
 #[derive(Clone, Debug)]
 struct ValueTable {
     next_value_num: usize,
     /// numbering of registers
     reg: HashMap<RegisterId, usize>,
-    /// numbering of expressions
-    expr: HashMap<Expr, usize>,
     /// from block unique instruction index to actual Operand(s)
     /// COVEAT: RegisterId cannot be allocs
-    leader: HashMap<(BlockId, usize), RegisterId>,
+    leader: HashMap<usize, RegisterId>,
 }
 
 impl Default for ValueTable {
@@ -110,7 +127,6 @@ impl Default for ValueTable {
         Self {
             next_value_num: 1,
             reg: Default::default(),
-            expr: Default::default(),
             leader: Default::default(),
         }
     }
@@ -132,122 +148,206 @@ pub struct GvnInner {}
 impl Optimize<FunctionDefinition> for GvnInner {
     fn optimize(&mut self, code: &mut FunctionDefinition) -> bool {
         let mut changed = false;
+
+        let mut next_expr_num = 1;
+        let mut alloc_num = || {
+            let val = next_expr_num;
+            next_expr_num += 1;
+            val
+        };
+        let mut expr_tbl = HashMap::new();
+
         let (cfg, bid_to_idx) = build_cfg(code);
         let dom = simple_fast(&cfg, *bid_to_idx.get(&code.bid_init).unwrap());
-        dbg!(&dom);
 
-        let mut tbls = HashMap::new();
+        let mut value_tbls = HashMap::new();
+        let mut replaces: HashMap<BlockId, HashMap<usize, usize>> = HashMap::new();
 
-        let mut queue = VecDeque::from(code.reverse_post_order());
-        let mut visited = HashSet::new();
-
-        while !queue.is_empty() {
-            let bid = queue.pop_front().unwrap();
-            if !visited.insert(bid) {
-                continue;
-            }
+        for bid in code.reverse_post_order() {
             let mut block = code.blocks.remove(&bid).unwrap();
 
-            // TODO: use idom's value tbl
-            let mut tbl = if bid == code.bid_init {
+            let mut value_tbl = if bid == code.bid_init {
                 ValueTable::default()
             } else {
                 let idom_node_idx = dom
                     .immediate_dominator(*bid_to_idx.get(&bid).unwrap())
                     .unwrap();
                 let idom = cfg[idom_node_idx];
-                tbls.get(&idom).cloned().unwrap()
+                value_tbls.get(&idom).cloned().unwrap()
             };
+
+            let preds = predecessors(&cfg, &bid_to_idx, &bid);
 
             // handle phinodes
             for aid in 0..block.phinodes.len() {
                 let mut numbers = vec![];
-                for pred in predecessors(&cfg, &bid_to_idx, &bid) {
+                for pred in &preds {
+                    let pred_tbl = match value_tbls.get(pred) {
+                        Some(t) => t,
+                        None => {
+                            continue;
+                        }
+                    };
                     let pred_block = code.blocks.get_mut(&pred).unwrap();
-                    let pred_tbl = tbls.get(&pred).unwrap();
                     pred_block.exit.walk_jump_args(|arg| {
-                        if let Some((reg_id, _)) = arg.args[aid].get_register() {
-                            numbers.push(pred_tbl.reg.get(reg_id).cloned().unwrap());
+                        if arg.bid == bid {
+                            // dbg!((pred, aid, &arg.args));
+                            if let Some((reg_id, _)) = arg.args[aid].get_register() {
+                                numbers.push(pred_tbl.reg.get(reg_id).cloned().unwrap_or_else(
+                                    || {
+                                        // dbg!((reg_id, pred_tbl, &expr_tbl));
+                                        todo!()
+                                    },
+                                ));
+                            }
                         }
                     });
                 }
+                // dbg!((bid, &numbers));
 
-                // For a phinode %p = φ(%a, %b) of B,
-                if bid != code.bid_init && numbers.iter().all(|&n| n == numbers[0]) {
-                    // If RT(%a)=RT(%b)=Ⓝ, then RT(%p)=Ⓝ.
+                // For a phinode %p = φ(%a, %b) of B, If RT(%a)=RT(%b)=Ⓝ, then RT(%p)=Ⓝ.
+                if bid != code.bid_init
+                    && !numbers.is_empty()
+                    && numbers.iter().all(|&n| n == numbers[0])
+                {
                     let reg = RegisterId::Arg { bid, aid };
-                    let _ = tbl.reg.insert(reg, numbers[0]);
-                    let _ = tbl.leader.insert((bid, numbers[0]), reg);
+                    let _ = value_tbl.reg.insert(reg, numbers[0]);
                 } else {
                     // Otherwise, %p is assigned with a new number
-                    let num = tbl.alloc_num();
+                    let num = alloc_num();
                     let reg = RegisterId::Arg { bid, aid };
-                    let _ = tbl.reg.insert(reg, num);
-                    let _ = tbl.leader.insert((bid, num), reg);
+                    let _ = value_tbl.reg.insert(reg, num);
+                    let _ = value_tbl.leader.insert(num, reg);
                 }
             }
 
-            let mut replaces = HashMap::new();
-
+            // version number for each alloc in this block
+            let mut memver = HashMap::new();
             // handle instructions
             for (iid, insn) in block.instructions.iter_mut().enumerate() {
+                // println!("{}", insn);
                 let insn = insn.inner_mut();
                 insn.visit_ops_mut(|op| {
                     if let Operand::Register { rid, dtype } = op
-                        && let RegisterId::Temp { iid, .. } = rid
-                        && let Some(&replace) = replaces.get(iid)
+                        && let RegisterId::Temp { iid, bid } = rid
+                        && let Some(replace) = replaces.get(bid).and_then(|m| m.get(iid))
                     {
-                        let new_rid = tbl.leader.get(&(bid, replace)).cloned().unwrap();
+                        let new_rid = value_tbl.leader.get(replace).cloned().unwrap_or_else(|| {
+                            dbg!((&value_tbl, replace, &expr_tbl));
+                            panic!();
+                        });
                         *rid = new_rid;
                     }
                 });
 
-                let expr = Expr::new(insn, &tbl);
-                match tbl.expr.get(&expr) {
-                    // If LT@pc(Ⓝ) exists, then replaces %i with LT@pc(Ⓝ).
-                    Some(num) => {
-                        changed = true;
-                        let _ = replaces.insert(iid, *num);
-                    }
+                // update memory version
+                if let Instruction::Store { ptr, .. } | Instruction::Load { ptr } = insn
+                    && let Some((rid, _)) = ptr.get_register()
+                    && let RegisterId::Local { aid } = rid
+                {
+                    *memver.entry(*aid).or_default() += 1;
+                }
+
+                // lookup or insert expr
+                let expr = match Expr::new(insn, &value_tbl, &memver) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let num = match expr_tbl.get(&expr) {
+                    Some(num) => *num,
                     None => {
-                        let num = tbl.alloc_num();
-                        let _ = tbl.expr.insert(expr, num);
-
-                        let mut n_exists_for_all_preds = true;
-                        let preds = predecessors(&cfg, &bid_to_idx, &bid);
-                        for &pred in &preds {
-                            let pred_block = code.blocks.get_mut(&pred).unwrap();
-                            let pred_tbl = tbls.get(&pred).unwrap();
-                            if !pred_tbl.leader.contains_key(&(pred, num)) {
-                                n_exists_for_all_preds = false;
-                                break;
-                            }
-                        }
-
-                        // If [LT@B final(Ⓝ) exists for all predecessor B of %i’s block],
-                        // then creates a new phinode, say %p=φ({LT@B final(Ⓝ) | B ∈ pred(%i)});
-                        // let LT@pc(Ⓝ) = %p; and replaces %i with %p.
-                        if !preds.is_empty() && n_exists_for_all_preds {
-                            changed = true;
-                            todo!()
-                        } else {
-                            // Otherwise, let LT@pc(Ⓝ) = %i.
-                            let reg = RegisterId::Temp { bid, iid };
-                            let _ = tbl.reg.insert(reg, num);
-                            let _ = tbl.leader.insert((bid, num), reg);
-                        }
+                        let num = alloc_num();
+                        let _ = expr_tbl.insert(expr, num);
+                        num
                     }
+                };
+                let _ = value_tbl.reg.insert(RegisterId::Temp { bid, iid }, num);
+
+                // If LT@pc(Ⓝ) exists, then replaces %i with LT@pc(Ⓝ).
+                if value_tbl.leader.contains_key(&num) {
+                    let _ = replaces.entry(bid).or_default().insert(iid, num);
+                    continue;
+                }
+
+                // if we should insert phinode
+                let mut pred_has_num_cnt = 0;
+                for &pred in &preds {
+                    if value_tbls
+                        .get(&pred)
+                        .and_then(|m| m.leader.get(&num))
+                        .is_some()
+                    {
+                        pred_has_num_cnt += 1;
+                    }
+                }
+
+                // If [LT@B final(Ⓝ) exists for all predecessor B of %i’s block],
+                // then creates a new phinode, say %p=φ({LT@B final(Ⓝ) | B ∈ pred(%i)});
+                // and:
+                //  1. LT@pc(Ⓝ) = %p;
+                //  2. replaces %i with %p.
+                if pred_has_num_cnt == preds.len()
+                    && pred_has_num_cnt >= 2
+                    && !insn.dtype().is_unit()
+                {
+                    // dbg!(&insn);
+                    // dbg!(&preds);
+                    changed = true;
+                    let _ = value_tbl.leader.insert(
+                        num,
+                        RegisterId::Arg {
+                            bid,
+                            aid: block.phinodes.len(),
+                        },
+                    );
+                    block.phinodes.push(Named::new(None, insn.dtype()));
+                    // println!("should replace with phi at {}-{}, {}", bid, iid, insn);
+                    let _ = replaces.entry(bid).or_default().insert(iid, num);
+
+                    // fix predecessors
+                    for &pred in &preds {
+                        let pred_tbl = match value_tbls.get(&pred) {
+                            Some(t) => t,
+                            None => continue,
+                        };
+                        let rid = pred_tbl.leader.get(&num).cloned().unwrap();
+                        let pred_block = code.blocks.get_mut(&pred).unwrap();
+                        pred_block.exit.walk_jump_args_mut(|arg| {
+                            arg.args.push(Operand::Register {
+                                rid,
+                                dtype: insn.dtype(),
+                            });
+                        });
+                    }
+                } else {
+                    // Otherwise, let LT@pc(Ⓝ) = %i.
+                    let _ = value_tbl.leader.insert(num, RegisterId::Temp { bid, iid });
                 }
             }
 
-            // dbg!(bid, &tbl);
+            let mut update_op = |op: &mut Operand| {
+                if let Some((rid, _)) = op.get_register_mut()
+                    && let RegisterId::Temp { bid, iid } = rid
+                    && let Some(replace) = replaces.get(bid).and_then(|m| m.get(iid))
+                {
+                    let replace = value_tbl.leader.get(replace).cloned().unwrap();
+                    *rid = replace;
+                }
+            };
+
+            block.exit.visit_op(update_op);
+
+            block.exit.walk_jump_args_mut(|arg| {
+                for op in &mut arg.args {
+                    update_op(op);
+                }
+            });
+
+            // dbg!((bid, &value_tbl));
+
             let _ = code.blocks.insert(bid, block);
 
-            let _ = tbls.insert(bid, tbl);
-
-            for next in successors(&cfg, &bid_to_idx, &bid) {
-                queue.push_back(next);
-            }
+            let _ = value_tbls.insert(bid, value_tbl);
         }
 
         changed
@@ -268,13 +368,31 @@ mod tests {
             &Path::new("examples/gvn/gvn.output.ir"),
             &mut Gvn::default(),
         );
+
+        test_opt(
+            &Path::new("examples/gvn/temp.input.ir"),
+            &Path::new("examples/gvn/temp.output.ir"),
+            &mut Gvn::default(),
+        );
     }
 
     #[test]
     fn test_gvn_basic2() {
         test_opt(
-            &Path::new("examples/ir3/foo.ir"),
-            &Path::new("examples/ir4/foo.ir"),
+            &Path::new("examples/ir3/pointer.ir"),
+            &Path::new("examples/ir4/pointer.ir"),
+            &mut Gvn::default(),
+        );
+
+        test_opt(
+            &Path::new("examples/ir3/temp2.ir"),
+            &Path::new("examples/ir4/temp2.ir"),
+            &mut Gvn::default(),
+        );
+
+        test_opt(
+            &Path::new("examples/ir3/logical_op.ir"),
+            &Path::new("examples/ir4/logical_op.ir"),
             &mut Gvn::default(),
         );
     }

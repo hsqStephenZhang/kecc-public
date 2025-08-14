@@ -24,8 +24,8 @@ block b0:
   %b0:i14:i32 = add %b0:i5:i32 %b0:i13:i32
   %b0:i15:i8* = getelementptr %l0:struct color* offset 4:i64
   %b0:i16:i8 = load %b0:i8:i8*
-  %b0:i17:i32 = typecast %b0:i16:i8 to i32
-  %b0:i18:i32 = add %b0:i14:i32 %b0:i17:i32
+  %b0:i17:i32 = typecast %b0:i12:i8 to i32
+  %b0:i18:i32 = add %b0:i14:i32 %b0:i13:i32
   j b2(%b0:i18:i32, 0:i32)
 
 block b2:

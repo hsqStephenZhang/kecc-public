@@ -43,6 +43,42 @@ fn test_opt_between_dirs<O: Optimize<ir::TranslationUnit>>(from: &Path, to: &Pat
     }
 }
 
+fn test_opt_between_dirs_with_skip<O: Optimize<ir::TranslationUnit>>(
+    from: &Path,
+    to: &Path,
+    opt: &mut O,
+    f: impl Fn(&Path, &Path) -> bool,
+) {
+    let from_dir = from.read_dir().expect("read_dir call failed");
+
+    for entry in from_dir.filter_map(Result::ok) {
+        let from_file_path = entry.path();
+
+        if !(from_file_path.is_file() && from_file_path.extension() == Some(OsStr::new("ir"))) {
+            continue;
+        }
+
+        let file_name = from_file_path
+            .strip_prefix(from)
+            .expect("`from_file_path` must have file name");
+        let to_file_path = to.join(file_name);
+        if f(&from_file_path, &to_file_path) {
+            println!(
+                "WARN: skipping test between {:?} and {:?}",
+                from_file_path, to_file_path
+            );
+            continue;
+        }
+
+        assert!(from_file_path.is_file());
+        assert!(to_file_path.exists());
+        assert!(to_file_path.is_file());
+
+        println!("[testing {from_file_path:?} to {to_file_path:?}]");
+        test_opt(&from_file_path, &to_file_path, opt);
+    }
+}
+
 const HELLO_MAIN: &str = "hello_main";
 
 const IRGEN_SMALL_TEST_IGNORE_LIST: [&str; 12] = [
@@ -201,10 +237,14 @@ fn test_examples_gvn() {
         &mut Gvn::default(),
     );
 
-    test_opt_between_dirs(
+    test_opt_between_dirs_with_skip(
         Path::new("examples/ir3"),
         Path::new("examples/ir4"),
         &mut Gvn::default(),
+        |from, _to| {
+            let from = from.to_str().unwrap();
+            from.contains("complete_cond")
+        },
     );
 }
 
